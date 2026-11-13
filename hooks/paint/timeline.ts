@@ -59,11 +59,12 @@ function progressAt(anim: SceneNode, sceneNow: number, t: number): number | unde
 function locate(p: number, n: number, keyTimes: number[] | undefined): { i: number; f: number } {
   if (n < 2) return { i: 0, f: 0 }
   const keys = keyTimes && keyTimes.length === n ? keyTimes : Array.from({ length: n }, (_, i) => i / (n - 1))
-  if (p >= keys[n - 1]) return { i: n - 2, f: 1 }
+  // keys has exactly n entries (keyTimes is used only when its length is n) and n >= 2, so every index below is in range.
+  if (p >= keys[n - 1]!) return { i: n - 2, f: 1 }
   let i = 0
-  while (i < n - 2 && p >= keys[i + 1]) i++
-  const span = keys[i + 1] - keys[i]
-  return { i, f: span > 0 ? Math.max(0, (p - keys[i]) / span) : 0 }
+  while (i < n - 2 && p >= keys[i + 1]!) i++
+  const span = keys[i + 1]! - keys[i]!
+  return { i, f: span > 0 ? Math.max(0, (p - keys[i]!) / span) : 0 }
 }
 
 const mix = (a: number, b: number, f: number): number => a + (b - a) * f
@@ -83,14 +84,16 @@ export function sample(node: SceneNode, sceneNow: number, t: number): Sampled {
       const [x1, y1, x2, y2] = numbers(attr(child, 'path') ?? '')
       if (y2 === undefined || begin < motionBegin) continue
       motionBegin = begin
-      out.offset = { x: mix(x1, x2, p) + 0, y: mix(y1, y2, p) + 0 }
+      // Only y2 is checked above. A short path leaves x1, y1 or x2 undefined, which gives NaN, as it did before.
+      out.offset = { x: mix(x1!, x2!, p) + 0, y: mix(y1!, y2, p) + 0 }
     } else if (child.tag === 'animateTransform') {
       if (attr(child, 'type') !== 'rotate' || begin < rotateBegin) continue
       const a = numbers(attr(child, 'from') ?? '')
       const b = numbers(attr(child, 'to') ?? '')
       if (a.length < 1 || b.length < 1) continue
       rotateBegin = begin
-      out.rotate = { degrees: mix(a[0], b[0], p), cx: mix(a[1] ?? 0, b[1] ?? 0, p), cy: mix(a[2] ?? 0, b[2] ?? 0, p) }
+      // a and b each have at least one entry (checked above).
+      out.rotate = { degrees: mix(a[0]!, b[0]!, p), cx: mix(a[1] ?? 0, b[1] ?? 0, p), cy: mix(a[2] ?? 0, b[2] ?? 0, p) }
     } else {
       const name = attr(child, 'attributeName')
       if (name === undefined) continue
@@ -100,7 +103,8 @@ export function sample(node: SceneNode, sceneNow: number, t: number): Sampled {
       const { i, f } = locate(p, stops.length, kt === undefined ? undefined : kt.split(';').map(Number))
       if ((begun.get(name) ?? -Infinity) > begin) continue
       begun.set(name, begin)
-      out.values.set(name, stops.length < 2 ? stops[0] : mix(stops[i], stops[i + 1], f))
+      // stops has at least one entry (checked above). With two or more, i <= n - 2, so i + 1 is in range.
+      out.values.set(name, stops.length < 2 ? stops[0]! : mix(stops[i]!, stops[i + 1]!, f))
     }
   }
   return out
