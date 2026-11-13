@@ -160,6 +160,7 @@ From the API types (2.1.322; Claude Code has since updated to 2.1.323), the engi
   - `/setup`: the options, the light flag, the picture size;
   - `/board`: the board and the plugin's clock `now`;
   - `/pause` and `/resume`;
+  - `/frame`: paint one fresh frame now unless paused. The plugin posts it when the pane renders and no frame arrived in the last 250 ms, because a remounted Image shows a blank box until a fresh name arrives (measured in Ghostty).
   - `/stats`: returns counters.
 
   The socket carries only these messages; no frame data passes through it or the disk.

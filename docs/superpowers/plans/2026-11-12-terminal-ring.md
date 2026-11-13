@@ -40,7 +40,7 @@
 - **Helper protocol.**
   - **Socket:** `<dir>/lot-map-<tag>/h.sock`, where `<dir>` is `TMPDIR` unless the path would exceed 100 bytes, then `/tmp`. The directory is mode 0700.
   - **Stdout lines:** `R`, `F <name> <width> <height> <generation>`, `S <text>` (only while frames flow), `E <message>`.
-  - **Requests:** POST `/setup`, `/board`, `/pause`, `/resume`, `/stats`.
+  - **Requests:** POST `/setup`, `/board`, `/pause`, `/resume`, `/frame`, `/stats`.
   - **Shared-memory names:** `/lm-<tag>-<k>`, k 0–7, where the tag is 8 characters of `[a-z0-9]` kept in `$.state`. Every frame carries a `generation` (the helper's frame counter), the ImageSource field for a reused name.
   - **Parent death.** The helper never watches stdin (`$.process.spawn` closes it from the start). It ends on SIGTERM, SIGINT, SIGHUP or SIGPIPE, on an error writing stdout, or when a 2 s poll finds `process.ppid === 1`.
 - **Budgets,** measured by `bun scripts/bench.ts`: under bun, after 10 warm-up frames, on the real busy map at `pictureFor(20)`. They are never tested inside `claude plugin test`, whose runtime is several times slower.
@@ -656,6 +656,7 @@ test('helper lines are read across pieces and malformed ones are dropped', () =>
       - `POST /setup` with a `HelperSetup`;
       - `POST /board` with `{ board, now, changedAt }`;
       - `POST /pause`, `POST /resume`;
+      - `POST /frame`, which paints one fresh frame now unless paused (ruling R11, from the Ghostty probe: a remounted Image shows a blank box until a fresh name arrives);
       - `POST /stats`, which returns `HelperStats` as JSON.
 
       Anything else answers 404. A malformed body answers 400 and changes nothing.
@@ -760,7 +761,7 @@ test('clean drops all eight names, and expire drops frames unread after a second
   - **The render hook** (terminal surface) is the one place that decides the mode and starts the helper, the first time picture mode applies. It also posts boards, because it re-runs on every board write.
     - It offers each new board to the `Coalescer` with `now` and `changedAt`.
     - When `offer` returns undefined, it arms `$.clock.after(waitMs)` in its closure (once per pending value) to flush `due()`.
-    - It also posts `/resume` when the pane was paused, and `/setup` when `rows` or `light` changed.
+    - It also posts `/resume` when the pane was paused, `/frame` when no `F` line arrived in the last 250 ms (a remount while still would otherwise show a blank box), and `/setup` when `rows` or `light` changed.
   - **The stdout loop** lives in a closure written in the render hook, for the session's life. If Step 1 shows that does not survive, it moves to `session.start`'s closure.
   - **`light`** is `setup.theme === 'auto' && themeRow.startsWith('light')`. With an explicit `light` or `dark`, the scene is already in that palette.
   - **The theme row** is read on the first render and in a `config.set` hook on `{ key: 'theme' }`, which then posts `/setup` and invalidates.
