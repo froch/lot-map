@@ -54,7 +54,8 @@ try {
   fail(`shm: ${oneLine(e)}`)
 }
 
-const ring = new NameRing(tag, shm)
+// The first generation is the clock at start, so a restart never repeats a (name, generation) pair.
+const ring = new NameRing(tag, shm, 8, Date.now())
 ring.clean()
 
 let stopping = false

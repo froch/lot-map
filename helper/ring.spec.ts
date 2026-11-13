@@ -14,14 +14,26 @@ const fakeShm = () => {
 
 test('frames go round eight names with rising generations; all eight unread skips the frame', () => {
   const { shm, live } = fakeShm()
-  const ring = new NameRing('abcd1234', shm)
+  const ring = new NameRing('abcd1234', shm, 8, 1000)
   const written = Array.from({ length: 8 }, (_, k) => ring.write(new Uint8Array([k]), k)!)
   expect(new Set(written.map(w => w.name)).size).toBe(8)
   expect(written.every(w => /^\/lm-abcd1234-[0-7]$/.test(w.name))).toBe(true)
-  expect(written.map(w => w.generation)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+  expect(written.map(w => w.generation)).toEqual([1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007])
   expect(ring.write(new Uint8Array([9]), 9)).toBeUndefined()
   live.delete(written[3]!.name)
-  expect(ring.write(new Uint8Array([10]), 10)).toEqual({ name: written[3]!.name, generation: 9 })
+  expect(ring.write(new Uint8Array([10]), 10)).toEqual({ name: written[3]!.name, generation: 1008 })
+})
+
+test('by default the first generation is the clock at start, so a restarted ring never repeats a name with its generation', () => {
+  const { shm, live } = fakeShm()
+  const before = Date.now()
+  const first = new NameRing('abcd1234', shm).write(new Uint8Array([1]), 0)!
+  expect(first.generation).toBeGreaterThanOrEqual(before)
+  expect(first.generation).toBeLessThanOrEqual(Date.now())
+  live.clear()
+  const again = new NameRing('abcd1234', shm, 8, first.generation + 1).write(new Uint8Array([1]), 0)!
+  expect(again.name).toBe(first.name)
+  expect(again.generation).toBeGreaterThan(first.generation)
 })
 
 test('clean drops all eight names, and expire drops frames unread after a second', () => {

@@ -36,6 +36,11 @@ export type LoopDeps = {
 
 /** Frames are never closer together than the fastest rate, however fast boards arrive. */
 const MIN_GAP_MS = 50
+/**
+ * The longest single sleep. A later wake (a board dated ahead, a clock set back) is reached by several sleeps, each
+ * re-checking the motion; timers never see a delay past what setTimeout can hold.
+ */
+const MAX_SLEEP_MS = 60_000
 /** When a board's `now` and the helper's clock differ by more than this, the loop samples at its clock plus the offset fixed at that post. */
 const SKEW_MS = 1000
 /** Once still or paused, one expire this long after the last frame unlinks what the terminal never read. */
@@ -114,6 +119,16 @@ export class FrameLoop {
     this.replan()
   }
 
+  /**
+   * One fresh frame now, even when still: a remounted Image needs a name it has not consumed yet. Nothing while
+   * paused. A moving map just paints its next frame now.
+   */
+  frame(): void {
+    if (this.paused) return
+    this.owed = true
+    this.replan()
+  }
+
   stats(): HelperStats {
     const t = this.total
     return {
@@ -131,17 +146,19 @@ export class FrameLoop {
     this.cancelTick = undefined
   }
 
-  /** Cancels the pending tick and plans one now, or once the last paint is MIN_GAP_MS old. */
+  /** Cancels the pending tick and plans one now, or once the last paint is MIN_GAP_MS old (never later, if the clock went back). */
   private replan(): void {
     this.stopTicking()
     if (this.paused || this.posted === undefined || this.setup === undefined) return
     const now = this.deps.now()
-    this.plan(this.lastPaintAt === undefined ? now : Math.max(now, this.lastPaintAt + MIN_GAP_MS), now)
+    const gap = this.lastPaintAt === undefined ? 0 : Math.min(MIN_GAP_MS, Math.max(0, this.lastPaintAt + MIN_GAP_MS - now))
+    this.plan(now + gap, now)
   }
 
+  /** The next tick at `at`, or after MAX_SLEEP_MS if that is sooner; the tick re-checks the motion either way. */
   private plan(at: number, now: number): void {
     this.due = at
-    this.cancelTick = this.deps.schedule(Math.max(0, at - now), () => this.tick())
+    this.cancelTick = this.deps.schedule(Math.min(MAX_SLEEP_MS, Math.max(0, at - now)), () => this.tick())
   }
 
   private tick(): void {
@@ -157,7 +174,8 @@ export class FrameLoop {
       stage = 'motion'
       const { fps, wakeAt } = motionAt(scene, t, posted.changedAt)
       let skipped = false
-      if (fps > 0 || this.moving || this.owed) {
+      const paints = fps > 0 || this.moving || this.owed
+      if (paints) {
         this.reportSecond(now)
         stage = 'paint'
         const a = performance.now()
@@ -183,6 +201,7 @@ export class FrameLoop {
         if (!this.moving || fps !== this.rate) this.due = now
         let due = this.due + period
         if (due < now) due += Math.ceil((now - due) / period) * period
+        else if (due > now + period) due = now + period // the clock went back
         this.moving = true
         this.rate = fps
         this.plan(due, now)
@@ -194,7 +213,8 @@ export class FrameLoop {
       let next = skipped ? now + RETRY_MS : undefined
       if (wakeAt !== undefined) next = Math.min(next ?? Infinity, now + Math.ceil(wakeAt - t))
       if (next !== undefined) this.plan(next, now)
-      this.armExpire()
+      // Only after a tick that painted: a wake that paints nothing leaves the planned expire alone.
+      if (paints) this.armExpire()
     } catch (e) {
       this.deps.emit(`E ${stage}: ${oneLine(e)}`)
       this.owed = false
@@ -230,7 +250,8 @@ export class FrameLoop {
     this.cancelExpire = undefined
     if (this.lastFrameAt === undefined) return
     const now = this.deps.now()
-    this.cancelExpire = this.deps.schedule(Math.max(0, this.lastFrameAt + EXPIRE_AFTER_MS - now), () => {
+    const wait = Math.min(EXPIRE_AFTER_MS, Math.max(0, this.lastFrameAt + EXPIRE_AFTER_MS - now))
+    this.cancelExpire = this.deps.schedule(wait, () => {
       this.cancelExpire = undefined
       try {
         this.expired += this.deps.expire(this.deps.now())

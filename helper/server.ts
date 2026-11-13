@@ -93,8 +93,9 @@ const bad = (why: string): Response => new Response(why, { status: 400 })
 const notFound = (): Response => new Response('not found', { status: 404 })
 
 /**
- * Listens on `path` and hands each request to the loop: POST /setup, /board, /pause, /resume and /stats.
- * Anything else answers 404; a malformed body answers 400 and changes nothing.
+ * Listens on `path` and hands each request to the loop: POST /setup, /board, /pause, /resume, /frame (one fresh
+ * frame now, for a remounted Image) and /stats. Anything else answers 404; a malformed body answers 400 and changes
+ * nothing.
  */
 export function serve(path: string, loop: FrameLoop): { stop(): void } {
   const server = Bun.serve({
@@ -116,10 +117,12 @@ export function serve(path: string, loop: FrameLoop): { stop(): void } {
           return ok()
         }
         case '/pause':
-        case '/resume': {
+        case '/resume':
+        case '/frame': {
           if (!isNothing(await req.text())) return bad(`${route.slice(1)}: expected an empty body or {}`)
           if (route === '/pause') loop.pause()
-          else loop.resume()
+          else if (route === '/resume') loop.resume()
+          else loop.frame()
           return ok()
         }
         case '/stats':

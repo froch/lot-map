@@ -45,6 +45,11 @@ function fakeClock(start: number) {
       }
       now = end
     },
+    /** Sets the wall clock by `ms` (back when negative); pending timers keep their remaining delays, as real timers do. */
+    jump(ms: number): void {
+      now += ms
+      for (const q of queue) q.at += ms
+    },
     pending: () => queue.length,
   }
 }
@@ -53,6 +58,8 @@ function harness(start = NOW) {
   const clock = fakeClock(start)
   const lines: string[] = []
   const painted: { scene: Scene; t: number; at: number }[] = []
+  const delays: number[] = []
+  const expires: number[] = []
   let generation = 0
   const loop = new FrameLoop({
     now: clock.now,
@@ -64,12 +71,12 @@ function harness(start = NOW) {
       generation++
       return { name: `/lm-test0001-${(generation - 1) % 8}`, generation }
     },
-    expire: () => 0,
+    expire: now => (expires.push(now), 0),
     emit: line => lines.push(line),
-    schedule: (ms, fn) => clock.schedule(ms, fn),
+    schedule: (ms, fn) => (delays.push(ms), clock.schedule(ms, fn)),
   })
   const count = (kind: string) => lines.filter(l => l.startsWith(`${kind} `)).length
-  return { clock, loop, lines, painted, frames: () => count('F'), stats: () => count('S') }
+  return { clock, loop, lines, painted, delays, expires, frames: () => count('F'), stats: () => count('S') }
 }
 
 const between = (n: number, lo: number, hi: number) => {
@@ -292,4 +299,53 @@ test('stats count frames and report the state', () => {
   expect(s.expired).toBe(0)
   expect(typeof s.paintMs).toBe('number')
   expect(typeof s.shmMs).toBe('number')
+})
+
+test('a wake 30 days ahead sleeps at most a minute at a time, and paints and expires nothing while it waits', () => {
+  const DAY = 86_400_000
+  const ahead = boardWith(entry({ station: 'shell', startedAt: NOW + 30 * DAY, endedAt: NOW + 30 * DAY + 1000, status: 'ok' }))
+  const h = start(ahead)
+  h.clock.run(2000)
+  expect(h.frames()).toBe(1)
+  const expiresBefore = h.expires.length
+  h.delays.length = 0
+  h.clock.run(5 * 60_000)
+  expect(h.frames()).toBe(1)
+  expect(h.delays.length).toBeGreaterThan(0)
+  expect(h.delays.length).toBeLessThanOrEqual(6)
+  expect(Math.max(...h.delays)).toBeLessThanOrEqual(60_000)
+  expect(h.expires.length).toBe(expiresBefore)
+  expect(h.loop.stats().state).toBe('still')
+})
+
+test('frame() while still paints exactly one fresh frame; while paused it paints none', () => {
+  const h = start(idle())
+  h.clock.run(1000)
+  expect(h.frames()).toBe(1)
+  h.loop.frame()
+  h.clock.run(1000)
+  expect(h.frames()).toBe(2)
+  h.loop.pause()
+  h.loop.frame()
+  h.clock.run(2000)
+  expect(h.frames()).toBe(2)
+  expect(h.loop.stats().state).toBe('paused')
+})
+
+test('a clock set back an hour neither delays the next board nor stalls a moving map', () => {
+  const h = start(idle())
+  h.clock.run(1000)
+  h.clock.jump(-3_600_000)
+  const board = fresh(h.clock.now())
+  h.loop.setBoard(board, h.clock.now(), changedAt(board))
+  h.clock.run(60)
+  expect(h.frames()).toBe(2)
+  h.clock.run(500)
+  between(h.frames(), 11, 13)
+  h.clock.jump(-3_600_000)
+  const later = fresh(h.clock.now())
+  h.loop.setBoard(later, h.clock.now(), changedAt(later))
+  h.clock.run(500)
+  between(h.frames(), 21, 23)
+  expect(Math.max(...h.delays)).toBeLessThanOrEqual(1100)
 })

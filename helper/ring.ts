@@ -1,5 +1,7 @@
 // The frames' names: a ring of `size` fixed names per session tag, each frame numbered by a running generation.
 // The terminal reads a name and unlinks it; until then the name is unread and cannot be written again.
+// The generation is the freshness marker of a reused name, so it starts at the clock when the helper starts: a
+// restarted helper with the same tag never repeats a (name, generation) pair of its predecessor.
 import type { Shm } from './shm'
 
 const EEXIST = 17
@@ -11,15 +13,18 @@ export class NameRing {
   /** When each name was last written, while it may still be unread. */
   private readonly writtenAt: (number | undefined)[]
   private next = 0
-  private generation = 0
+  /** The next frame's generation. */
+  private generation: number
 
   constructor(
     readonly tag: string,
     private readonly shm: Shm,
     readonly size = 8,
+    firstGeneration = Date.now(),
   ) {
     this.names = Array.from({ length: size }, (_, k) => `/lm-${tag}-${k}`)
     this.writtenAt = this.names.map(() => undefined)
+    this.generation = firstGeneration
   }
 
   /** Unlinks every name of the ring, read or not: a predecessor's leftovers at start, what is unread at exit. */
@@ -31,8 +36,8 @@ export class NameRing {
   }
 
   /**
-   * Writes a frame to the first name, from the next one round, that the terminal has read. Undefined when all are
-   * unread: backpressure, so the frame is skipped. Throws on any other failure.
+   * Writes a frame to the first name, from the next one round, that the terminal has read, numbered with the next
+   * generation. Undefined when all are unread: backpressure, so the frame is skipped. Throws on any other failure.
    */
   write(bytes: Uint8Array, now: number): { name: string; generation: number } | undefined {
     for (let i = 0; i < this.size; i++) {
@@ -43,8 +48,7 @@ export class NameRing {
       if (r !== 0) throw new Error(`shm_put ${name}: errno ${-r}`)
       this.next = (k + 1) % this.size
       this.writtenAt[k] = now
-      this.generation++
-      return { name, generation: this.generation }
+      return { name, generation: this.generation++ }
     }
     return undefined
   }
