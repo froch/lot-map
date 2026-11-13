@@ -210,13 +210,15 @@ test('in Ghostty the pane starts one helper, posts setup and board, and relays f
   const tag = w.spawned[0]!.at(-1)!
   expect(w.spawned[0]!.at(-2)).toBe(`/var/folders/ab/cdefgh/T/lot-map-${tag}/h.sock`)
   expect(w.posts.map(path)).toEqual(['/setup', '/board'])
-  expect(((await ui.find({ type: 'Image' }))!.props.source as { width: number }).width).toBe(1)
+  const first = (await ui.find({ type: 'Image' }))!.props.source as { width: number }
+  expect(first.width).toBe(1)
   w.frame(0); w.frame(1)
   await w.clock.settle()
   expect(w.blits.map(b => [b.name, b.generation])).toEqual([['/lm-abcd1234-0', 1], ['/lm-abcd1234-1', 2]])
   await ui.redraw()
   const image = await ui.find({ type: 'Image' })
-  expect(image?.props).toMatchObject({ key: 'map', columns: 45, rows: 20, source: { shm: '/lm-abcd1234-1', width: 727, height: 680 } })
+  expect(image?.props).toMatchObject({ key: 'map', columns: 45, rows: 20 })
+  expect(image?.props.source).toEqual(first) // frames reach the Image by blit, never by its source
 })
 
 test('iTerm2 starts no helper and shows no picture', SLOW, async ($, on) => {
@@ -368,7 +370,8 @@ test('a pane shown again while the map is still asks the helper for a fresh fram
   w.frame(1)
   await w.clock.settle()
   await again.redraw()
-  expect((await again.find({ type: 'Image' }))?.props.source).toEqual({ shm: '/lm-abcd1234-1', format: 'rgba', width: 727, height: 680, generation: 2 })
+  expect((await again.find({ type: 'Image' }))?.props.source).toMatchObject({ width: 1, height: 1 })
+  expect(w.blits.at(-1)).toMatchObject({ name: '/lm-abcd1234-1', generation: 2 })
   expect(w.spawned.length).toBe(1)
 })
 
@@ -451,6 +454,25 @@ test('a still map switched to text by the gate ends its helper by the next H, an
 
 const SHM = (k: number) => ({ shm: `/lm-abcd1234-${k % 8}`, format: 'rgba', width: 727, height: 680, generation: k + 1 })
 
+test('a board change after two frames redraws with the very same placeholder source, so no frame is re-sent', SLOW, async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  const placeholder = (await ui.find({ type: 'Image' }))!.props.source
+  w.frame(0); w.frame(1)
+  await w.clock.settle()
+  expect(w.blits.length).toBe(2)
+  await ui.redraw()
+  const before = (await ui.find({ type: 'Image' }))!.props.source
+  await $.tool.call({ tool: 'Read', file_path: '/a/b.ts' })
+  await w.clock.settle()
+  await ui.redraw()
+  const after = (await ui.find({ type: 'Image' }))!.props.source
+  expect(after).toEqual(before)
+  expect(after).toEqual(placeholder)
+  expect(after).not.toHaveProperty('shm')
+})
+
 test('a still map whose only frame meets the start-up refusal asks the helper again, and draws the next frame', SLOW, async ($, on) => {
   const w = world(on, { blit: n => (n === 1 ? { deny: STARTING } : {}), paints: true, silent: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -464,7 +486,8 @@ test('a still map whose only frame meets the start-up refusal asks the helper ag
   expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
   expect(w.blits.map(b => b.name)).toEqual(['/lm-abcd1234-0', '/lm-abcd1234-1'])
   await ui.redraw()
-  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual(SHM(1))
+  expect((await ui.find({ type: 'Image' }))?.props.source).toMatchObject({ width: 1, height: 1 })
+  expect(w.blits.at(-1)).toMatchObject({ name: SHM(1).shm, generation: SHM(1).generation })
   await w.clock.advance(30_000)
   expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
   expect((await $.command.run(STATS)).text).toMatch(/frames: 1 taken · 1 refused · 0 dropped · 1 asked again/)
@@ -483,7 +506,7 @@ test('a frame let go at the blit cap is asked for again, and the fresh one is dr
   expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
   expect(w.blits.map(b => b.generation).at(-1)).toBe(10)
   await ui.redraw()
-  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual(SHM(9))
+  expect((await ui.find({ type: 'Image' }))?.props.source).toMatchObject({ width: 1, height: 1 })
   expect((await $.command.run(STATS)).text).toMatch(/frames: 9 taken · 0 refused · 1 dropped · 1 asked again/)
 })
 
@@ -500,7 +523,8 @@ test('a not-mounted refusal right after a render asked for a frame is asked agai
   await w.clock.advance(150)
   expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame', '/frame'])
   await ui.redraw()
-  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual(SHM(2))
+  expect((await ui.find({ type: 'Image' }))?.props.source).toMatchObject({ width: 1, height: 1 })
+  expect(w.blits.at(-1)).toMatchObject({ name: SHM(2).shm, generation: SHM(2).generation })
   expect((await $.command.run(STATS)).text).toMatch(/helper: running/)
 })
 

@@ -212,7 +212,9 @@ From the API types (2.1.322; Claude Code has since updated to 2.1.323), the engi
   1. The picture, centred.
   2. The "now" Text, then the feed Texts, every Text cut to one row, the feed cut to fit `bodyRows`. There is no tally line.
 
-  The Image is `<Image key="map" columns={C} rows={R} source={…} alt={title + now line} />`, centred in a Box. Its `source` is the last frame's shm source, which the engine does not resend. Before any frame exists it is a 1×1 rgba pixel of the ground colour, so the box shows the ground until the first frame lands.
+  The Image is `<Image key="map" columns={C} rows={R} source={…} alt={title + now line} />`, centred in a Box. Its `source` is always the same placeholder, a 1×1 rgba pixel of the ground colour, never a frame. Frames arrive only through blits.
+
+On each redraw Claude Code compares the render's source with the previous render's. When it is unchanged, Claude Code keeps the latest swapped-in frame and sends nothing. When it changed, Claude Code re-sends the render's source. So a render returning the latest frame's shm name re-sent a name the terminal had already read, and Ghostty drew a blank box until the next frame: a flicker at every event, measured in the person's pane (ruling R18).
 
   If Ghostty refuses or blanks shm frames whose pixel size differs from the mounted source's, the placeholder becomes a ground picture at the current picture size instead: one send of up to about 5.7 MB of base64 per session and per resize. This is checked first in the wiring step (my call).
 - **Stats.** `/lot-map stats` reports:

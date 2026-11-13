@@ -99,8 +99,6 @@ type Picture = {
   killing?: Promise<unknown>
   helper: HelperState
   paused: boolean
-  /** The newest frame the Image took: what a redraw draws, the engine never sending it again. */
-  lastFrame?: ShmSource
   /** F lines are numbered as they come: the newest taken, the newest relayed, the newest known not taken. */
   lastFrameSeq: number
   sentSeq: number
@@ -587,7 +585,7 @@ export const register: Register = (on, options) => {
         }
       }
 
-      let source: ShmSource | PixelSource | undefined
+      let source: PixelSource | undefined
       if (why === undefined && box !== undefined && facts?.bun !== undefined) {
         const bun = facts.bun
         const env = facts.env
@@ -741,7 +739,6 @@ export const register: Register = (on, options) => {
               pic.gate.accepted(now) // the gate keeps no time for a taken frame
               if (seq > pic.lastFrameSeq) {
                 pic.lastFrameSeq = seq
-                pic.lastFrame = frame
               }
               askAgain(run) // an older frame taken while the newest was not: that one is still owed
               return
@@ -810,7 +807,6 @@ export const register: Register = (on, options) => {
           pic.current = run
           pic.helper = 'starting'
           pic.paused = false
-          pic.lastFrame = undefined
           pic.retries = 0
           pic.coalescer = new Coalescer<Board>()
           pic.offered = ''
@@ -904,7 +900,8 @@ export const register: Register = (on, options) => {
           const run = pic.current
           if (pic.helper === 'idle' || pic.helper === 'stopped') start(tag)
           else if (run?.isFed === true) feedHelper(run)
-          return pic.lastFrame ?? placeholder(setup, isLight())
+          // Always the same pixel: the engine re-sends a changed source, and a frame's shm is already read. Frames come by $.ui.blit.
+          return placeholder(setup, isLight())
         })
         if (source === undefined) why = { reason: 'failed' }
       }
