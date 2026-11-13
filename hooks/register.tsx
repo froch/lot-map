@@ -4,7 +4,7 @@ import type { EngineInterface, HttpResponse, Register, UiBlitResult } from 'clau
 import type { Board, Entry, StationId, Status } from '../types'
 import { STATIONS, classify, clean, describeNow, firstLine, foldRows, formatMs, memoryIds, setupFrom, shortModel } from './map'
 import type { Setup } from './map'
-import { changedAt } from './paint/motion'
+import { boardBody, setupBody } from './helper-bodies'
 import { DARK, LIGHT, lightPairs } from './palette'
 import { drawMap } from './svg'
 import { Coalescer, HelperPolicy, LineReader, PictureGate, newTag, ringBox, socketPath, terminalAllows } from './terminal'
@@ -286,7 +286,7 @@ export const register: Register = (on, options) => {
   const pic = freshPicture()
   /** In auto, the map follows Claude Code's theme row; a dark or light setting is already in its palette. */
   const isLight = (): boolean => setup.theme === 'auto' && (pic.themeRow ?? '').startsWith('light')
-  const setupBody = (): string => JSON.stringify({ options, light: isLight(), rows: pic.rows })
+  const setupNow = (): string => setupBody(options, isLight(), pic.rows)
 
   // Calls a settings hook refused, so that the tool's own row reads as blocked and not as an error.
   // Loses nothing across a reload that matters: a reload never lands in the middle of a call.
@@ -602,7 +602,7 @@ export const register: Register = (on, options) => {
           })
         const postBoard = async (run: Run, b: Board, at: number): Promise<void> => {
           pic.sent++
-          await post(run, '/board', JSON.stringify({ board: b, now: at, changedAt: changedAt(b) }))
+          await post(run, '/board', boardBody(b, at))
         }
         /** One timer per pending board: when it fires, the newest board offered goes. */
         const arm = (run: Run, coalescer: Coalescer<Board>, at: number): void => {
@@ -673,7 +673,7 @@ export const register: Register = (on, options) => {
         const ready = async (run: Run): Promise<void> => {
           run.isListening = true
           pic.helper = 'running'
-          pic.setupSent = setupBody()
+          pic.setupSent = setupNow()
           await post(run, '/setup', pic.setupSent)
           const at = await $.clock.now()
           if (run !== pic.current) return
@@ -683,7 +683,7 @@ export const register: Register = (on, options) => {
           pic.coalescer.offer(first, at) // a fresh coalescer: the first offer always goes
           run.isFed = true
           await postBoard(run, first, at)
-          const body = setupBody()
+          const body = setupNow()
           if (run === pic.current && body !== pic.setupSent) {
             pic.setupSent = body
             await post(run, '/setup', body)
@@ -740,7 +740,7 @@ export const register: Register = (on, options) => {
         /** What changed since the helper last heard: its setup, the board, a pause to lift, or no recent frame. */
         const feedHelper = (run: Run): void => {
           let isSending = false
-          const body = setupBody()
+          const body = setupNow()
           if (body !== pic.setupSent) {
             pic.setupSent = body
             isSending = true
