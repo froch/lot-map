@@ -59,3 +59,84 @@ test('a round-capped stroke reaches half its width past the end of the line; a b
   stroke(butt, line(10, 10, 30, 10), 6, WHITE, 1, 'butt')
   expect(butt.pixel(31, 10)[3]).toBe(0)
 })
+
+test('arc flags may run into the next number', () => {
+  const a = parsePath('M0 0a2 2 0 01-2 2')[0]!.points
+  near(a[a.length - 1]!.x, -2)
+  near(a[a.length - 1]!.y, 2)
+  const b = parsePath('M0 0a1 1 0 0110 10')[0]!.points
+  near(b[b.length - 1]!.x, 10)
+  near(b[b.length - 1]!.y, 10)
+})
+
+test('toBase64 gives straight RGBA', () => {
+  const c = new Canvas(3, 1)
+  fill(c, roundRect(0, 0, 1, 1, 0), parseColor('#102030'), 1)
+  fill(c, roundRect(1, 0, 1, 1, 0), parseColor('#ff8000'), 0.5)
+  const bytes = (Uint8Array as unknown as { fromBase64(s: string): Uint8Array }).fromBase64(c.toBase64())
+  expect(Array.from(bytes.slice(0, 4))).toEqual([16, 32, 48, 255])
+  expect(Array.from(bytes.slice(8, 12))).toEqual([0, 0, 0, 0])
+  const mid = Array.from(bytes.slice(4, 8))
+  near(mid[0]!, 255, 1.5)
+  near(mid[1]!, 128, 1.5)
+  expect(mid[2]).toBe(0)
+  near(mid[3]!, 128, 1.5)
+})
+
+test('a round cap shows no dent next to it', () => {
+  const c = new Canvas(40, 20)
+  stroke(c, line(10.2, 10, 30, 10), 6, WHITE, 1, 'round')
+  expect(c.pixel(10, 10)[3]).toBe(255)
+  expect(c.pixel(9, 10)[3]).toBe(255)
+})
+
+test('parseColor reads #rgb and #rrggbb, and reads anything else as black', () => {
+  expect(parseColor('#fa0')).toEqual([255, 170, 0])
+  expect(parseColor('#e1ac6e')).toEqual([225, 172, 110])
+  expect(parseColor('nope')).toEqual([0, 0, 0])
+})
+
+test('copyFrom copies pixels', () => {
+  const a = new Canvas(4, 4)
+  fill(a, roundRect(0, 0, 4, 4, 0), parseColor('#336699'), 1)
+  const b = new Canvas(4, 4)
+  b.copyFrom(a)
+  expect(b.pixel(2, 2)).toEqual([51, 102, 153, 255])
+})
+
+test('half-alpha source-over on an opaque colour gives the mixed colour', () => {
+  const c = new Canvas(2, 2)
+  fill(c, roundRect(0, 0, 2, 2, 0), parseColor('#000000'), 1)
+  fill(c, roundRect(0, 0, 2, 2, 0), parseColor('#ffffff'), 0.5)
+  const p = c.pixel(1, 1)
+  near(p[0], 128, 1.5)
+  expect(p[3]).toBe(255)
+})
+
+test('relative commands end where the absolute ones do', () => {
+  const end = (d: string) => { const p = parsePath(d)[0]!.points; return p[p.length - 1]! }
+  const e = end('m1 1l2 0h3v4')
+  near(e.x, 6); near(e.y, 5)
+  const c = end('m1 1c1 0 2 1 3 3s1 1 2 0')
+  near(c.x, 6); near(c.y, 4)
+  const q = end('m1 1q1 2 4 0')
+  near(q.x, 5); near(q.y, 1)
+  const z = parsePath('m1 1l4 0 0 4z')[0]!
+  expect(z.closed).toBe(true)
+  const q2 = end('M1 1Q3 3 5 1')
+  near(q2.x, 5); near(q2.y, 1)
+})
+
+test('non-zero winding keeps same-direction nesting filled and cuts a reverse-direction hole', () => {
+  const sq = (x: number, y: number, s: number, rev: boolean) => {
+    const pts = [{ x, y }, { x: x + s, y }, { x: x + s, y: y + s }, { x, y: y + s }]
+    return { points: rev ? pts.reverse() : pts, closed: true }
+  }
+  const same = new Canvas(20, 20)
+  fill(same, [sq(1, 1, 18, false), sq(6, 6, 8, false)], WHITE, 1)
+  expect(same.pixel(10, 10)[3]).toBe(255)
+  const hole = new Canvas(20, 20)
+  fill(hole, [sq(1, 1, 18, false), sq(6, 6, 8, true)], WHITE, 1)
+  expect(hole.pixel(10, 10)[3]).toBe(0)
+  expect(hole.pixel(3, 3)[3]).toBe(255)
+})

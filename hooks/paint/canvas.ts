@@ -11,8 +11,6 @@ export function parseColor(hex: string): Rgb {
   return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)]
 }
 
-const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-
 export class Canvas {
   readonly width: number
   readonly height: number
@@ -45,46 +43,24 @@ export class Canvas {
     return [Math.min(255, Math.round(d[i]! * k)), Math.min(255, Math.round(d[i + 1]! * k)), Math.min(255, Math.round(d[i + 2]! * k)), a]
   }
 
+  private straight: Uint8Array | null = null
+
   /** The picture as straight RGBA, base64. */
   toBase64(): string {
     const d = this.data
-    const n = d.length
-    const out: number[] = []
-    const parts: string[] = []
-    let b0 = 0
-    let b1 = 0
-    let have = 0
-    const push = (b: number) => {
-      if (have === 0) { b0 = b; have = 1; return }
-      if (have === 1) { b1 = b; have = 2; return }
-      const v = (b0 << 16) | (b1 << 8) | b
-      out.push(B64.charCodeAt(v >> 18), B64.charCodeAt((v >> 12) & 63), B64.charCodeAt((v >> 6) & 63), B64.charCodeAt(v & 63))
-      have = 0
-      if (out.length >= 8192) {
-        parts.push(String.fromCharCode(...out))
-        out.length = 0
-      }
-    }
-    for (let i = 0; i < n; i += 4) {
+    const out = (this.straight ??= new Uint8Array(d.length))
+    for (let i = 0; i < d.length; i += 4) {
       const a = d[i + 3]!
       if (a === 255) {
-        push(d[i]!); push(d[i + 1]!); push(d[i + 2]!); push(255)
+        out[i] = d[i]!; out[i + 1] = d[i + 1]!; out[i + 2] = d[i + 2]!; out[i + 3] = 255
       } else if (a === 0) {
-        push(0); push(0); push(0); push(0)
+        out[i] = 0; out[i + 1] = 0; out[i + 2] = 0; out[i + 3] = 0
       } else {
         const k = 255 / a
-        push(Math.min(255, Math.round(d[i]! * k))); push(Math.min(255, Math.round(d[i + 1]! * k))); push(Math.min(255, Math.round(d[i + 2]! * k))); push(a)
+        out[i] = Math.min(255, Math.round(d[i]! * k)); out[i + 1] = Math.min(255, Math.round(d[i + 1]! * k)); out[i + 2] = Math.min(255, Math.round(d[i + 2]! * k)); out[i + 3] = a
       }
     }
-    if (have === 1) {
-      const v = b0 << 16
-      out.push(B64.charCodeAt(v >> 18), B64.charCodeAt((v >> 12) & 63), 61, 61)
-    } else if (have === 2) {
-      const v = (b0 << 16) | (b1 << 8)
-      out.push(B64.charCodeAt(v >> 18), B64.charCodeAt((v >> 12) & 63), B64.charCodeAt((v >> 6) & 63), 61)
-    }
-    parts.push(String.fromCharCode(...out))
-    return parts.join('')
+    return (out as unknown as { toBase64(): string }).toBase64()
   }
 
   /** Source-over of one colour at `sa` (0–1) on one pixel. */

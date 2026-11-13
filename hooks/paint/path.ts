@@ -101,36 +101,30 @@ export function parsePath(d: string, m: Matrix = IDENTITY): Polyline[] {
     }
     cur.push(apply(m, px, py))
   }
-  const re = /([MmLlHhVvCcSsQqTtAaZz])|([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)/g
-  const items: (string | number)[] = []
-  let mt: RegExpExecArray | null
-  while ((mt = re.exec(d))) items.push(mt[1] ?? Number(mt[2]))
-  let i = 0
+  let pos = 0
   let cmd = ''
+  const skip = () => { while (pos < d.length && /[\s,]/.test(d[pos]!)) pos++ }
+  const NUM = /[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/y
   const num = (): number => {
-    const v = items[i]
-    if (typeof v !== 'number') throw new Error('number expected')
-    i++
-    return v
+    skip()
+    NUM.lastIndex = pos
+    const mt = NUM.exec(d)
+    if (!mt) throw new Error('number expected')
+    pos = NUM.lastIndex
+    return Number(mt[0])
   }
+  // a flag is one character, 0 or 1, and may run straight into the next number
   const flag = (): boolean => {
-    // a flag may run into the next number ("11" or "10.5"): take one digit
-    const v = items[i]
-    if (typeof v !== 'number') throw new Error('flag expected')
-    if (v === 0 || v === 1) { i++; return v === 1 }
-    // packed digits such as 1 and the rest of the number
-    const s = String(v)
-    const first = s[0]
-    if ((first === '0' || first === '1') && s.length > 1) {
-      const rest = s.slice(1)
-      items[i] = Number(rest.startsWith('.') ? '0' + rest : rest)
-      return first === '1'
-    }
-    throw new Error('bad flag')
+    skip()
+    const ch = d[pos]
+    if (ch !== '0' && ch !== '1') throw new Error('flag expected')
+    pos++
+    return ch === '1'
   }
-  while (i < items.length) {
-    const it = items[i]
-    if (typeof it === 'string') { cmd = it; i++ }
+  for (;;) {
+    skip()
+    if (pos >= d.length) break
+    if (/[MmLlHhVvCcSsQqTtAaZz]/.test(d[pos]!)) { cmd = d[pos]!; pos++ }
     else if (!cmd) break
     else if (cmd === 'M') cmd = 'L'
     else if (cmd === 'm') cmd = 'l'
@@ -442,8 +436,8 @@ export function stroke(c: Canvas, lines: Polyline[], width: number, color: Rgb, 
           else if (t > len && s.roundB) v = hw + 0.5 - Math.hypot(px - dx, py - dy)
           else {
             v = Math.min(1, hw + 0.5 - perp)
-            if (t < 0.5) v = Math.min(v, t + 0.5)
-            if (t > len - 0.5) v = Math.min(v, len - t + 0.5)
+            if (!s.roundA && t < 0.5) v = Math.min(v, t + 0.5)
+            if (!s.roundB && t > len - 0.5) v = Math.min(v, len - t + 0.5)
           }
           if (v <= 0) continue
           if (v > 1) v = 1
