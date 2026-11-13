@@ -1,4 +1,4 @@
-# The Map in the Terminal: Implementation Plan (revision 2)
+# The Map in the Terminal: Implementation Plan (revision 2.1)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -39,10 +39,11 @@
   - start-up capability: `the terminal has not yet said whether it reads files on this machine`.
 - **Helper protocol.**
   - **Socket:** `<dir>/lot-map-<tag>/h.sock`, where `<dir>` is `TMPDIR` unless the path would exceed 100 bytes, then `/tmp`. The directory is mode 0700.
-  - **Stdout lines:** `R`, `F <name> <width> <height>`, `S <text>`, `E <message>`.
+  - **Stdout lines:** `R`, `F <name> <width> <height> <generation>`, `S <text>` (only while frames flow), `E <message>`.
   - **Requests:** POST `/setup`, `/board`, `/pause`, `/resume`, `/stats`.
-  - **Shared-memory names:** `/lm-<tag>-<k>`, k 0–7, where the tag is 8 characters of `[a-z0-9]` kept in `$.state`.
-- **Budgets,** under bun or the test runtime on the real busy map at `pictureFor(20)`:
+  - **Shared-memory names:** `/lm-<tag>-<k>`, k 0–7, where the tag is 8 characters of `[a-z0-9]` kept in `$.state`. Every frame carries a `generation` (the helper's frame counter), the ImageSource field for a reused name.
+  - **Parent death.** The helper never watches stdin (`$.process.spawn` closes it from the start). It ends on SIGTERM, SIGINT, SIGHUP or SIGPIPE, on an error writing stdout, or when a 2 s poll finds `process.ppid === 1`.
+- **Budgets,** measured by `bun scripts/bench.ts`: under bun, after 10 warm-up frames, on the real busy map at `pictureFor(20)`. They are never tested inside `claude plugin test`, whose runtime is several times slower.
   - a frame with no board change ≤ 7 ms on average;
   - the first frame after a one-station change ≤ 20 ms;
   - in the pane, Claude Code ≤ ~5% of a core while animating.
@@ -50,6 +51,7 @@
   - The kit's `expect` has no `toBeCloseTo`; each file defines `const near = (a: number, b: number, eps = 1e-6) => expect(Math.abs(a - b)).toBeLessThan(eps)`.
   - A test file whose import is missing fails as one `(fail) … did not load`.
   - Helper specs are `helper/*.spec.ts`, run with `bun test helper`; `claude plugin test` runs only `*.test.ts(x)`.
+  - Plugin tests that paint whole pictures, or that run a fake helper, set `{ timeoutMs: 30000 }`; the default is 5000. Pictures in plugin tests are compared with `===` on `toBase64()`, never fingerprinted in bulk.
 - **Pixel convention.** Pixel (x, y) covers [x, x+1) × [y, y+1) and is sampled at its centre. Storage is premultiplied 8-bit; colours are exact only at alpha 255.
 - **Version 0.4.0.**
 
@@ -159,7 +161,8 @@ test('the desktop drawing is unchanged, case by case', () => {
     - **slow:** breath, the running beat, both hands, crew rotation, glows, the cooling ring, beams, the route fade, the end dot's fade-out.
   - `isRestingBreath` is set on the breath circle.
   - `group`, used by the pixel painter's per-group cache in Task 8:
-    - `ground`: the background rect, the contours and the spokes;
+    - `ground`: the background rect and the contours, which change only with the theme, the background option or the size;
+    - `spoke:<id>`: that station's spoke and its worn overlay, whose width follows the station's count;
     - `station:<id>`: that station's under and over nodes;
     - `route:<k>`: route leg k and its end dot;
     - `motion`: beams, flights and returns;
@@ -182,7 +185,7 @@ test('every animation carries a motion class, every top-level node a group, and 
     const scene = sceneOf(g.board, g.now, setupFrom(g.options))
     for (const a of animations(scene.nodes)) expect(`${g.name} ${a.motion}`).toMatch(/ (fast|slow)$/)
     expect(scene.nodes.filter(n => n.isRestingBreath).length).toBe(1)
-    for (const n of scene.nodes) expect(`${g.name} ${n.group}`).toMatch(/ (ground|station:[a-z]+|route:\d+|motion|crew|core|rings)$/)
+    for (const n of scene.nodes) expect(`${g.name} ${n.group}`).toMatch(/ (ground|spoke:[a-z]+|station:[a-z]+|route:\d+|motion|crew|core|rings)$/)
   }
 })
 ```
@@ -274,78 +277,111 @@ test('motion along a line and rotation about a point', () => {
 ### Task 8: The pixel painter, sized to the pane, with per-group caching
 
 **Files:**
-- Create: `hooks/paint/scene-paint.ts`
+- Create: `hooks/paint/scene-paint.ts`, `scripts/bench.ts`
+- Modify: `hooks/paint/canvas.ts` (add `toStraight`)
 - Test: `hooks/paint.test.ts`
 
 **Interfaces:**
 - Consumes:
-  - `Scene`, `SceneNode` (with `group`) (Task 6);
+  - `Scene`, `SceneNode` with `group` (Task 6);
   - `sample`, `isChanging` (Task 7);
   - Task 1's primitives;
   - `drawText`, `FONT`, `TEXT_SCALE`;
   - `lightPairs`, `Palette` (Task 6).
 - Produces:
-  - `type Picture = { width: number; height: number; scale: number }`;
-  - `pictureFor(rows: number): Picture`, as in Global Constraints;
+  - `Canvas.toStraight(): Uint8Array`: straight RGBA bytes in a buffer the canvas reuses, valid until the next call. `toBase64()` now encodes it.
+  - `type Picture = { width: number; height: number; scale: number }` and `pictureFor(rows: number): Picture`, as in Global Constraints;
   - `type PaintOptions = { light: boolean; colors: Partial<Palette> }`, where `colors` is `setup.colors`;
-  - `class LayerCache { constructor(picture: Picture, options: PaintOptions); readonly repainted: string[] }`. It holds cached layers by key, across scenes. `repainted` lists the keys painted afresh by the last `paintScene` call.
+  - `class LayerCache { constructor(picture: Picture, options: PaintOptions); readonly repainted: string[]; readonly size: number }`. `repainted` holds the keys of cached layers built afresh (cache misses) by the last `paintScene`. Changing nodes painted directly each frame are not listed. `size` is the number of layers held.
   - `paintScene(scene: Scene, t: number, picture: Picture, options: PaintOptions, cache?: LayerCache): Canvas`.
 - Rules:
-  - **Splitting into layers.** Nodes are walked in order and split into runs at every change of `group` and at every node that `isChanging(node, scene.now, t)`.
-  - **Cached runs.** A run of non-changing nodes is one cached layer. Its key is the group, plus the run's node strings, plus the sampled values of any animated node in it. That makes it reusable across scenes and across frames while those values hold.
+  - **Splitting into layers.** Top-level nodes are walked in order and split into runs at every change of `group` and at every node that `isChanging(node, scene.now, t)`. One exception: the `isRestingBreath` node when `!scene.isAnyRunning` is not changing, and it is painted with its animations' first values.
+  - **Keys.** A run of non-changing nodes is one cached layer. Its key is the group, plus each node's own tag and attributes with animation children left out, plus the values sampled at t for its animated attributes, rounded to 3 decimals. The key therefore does not change when a scene is rebuilt with a later `now`, as long as what is drawn is the same.
   - **Painted runs.** Changing nodes are painted directly every frame.
+  - **Eviction.** After each `paintScene`, the cache drops every layer that frame did not use.
   - **Compositing.** Layers composite within their bounding boxes. The uncached path builds the same layers, so both paths agree byte for byte.
-  - **Painting rules from the spec.** Every attribute the scene carries is honoured. Text is unescaped and sized × `TEXT_SCALE`. With `light`, colours go through `lightPairs(colors)`. When `!scene.isAnyRunning`, the `isRestingBreath` node is painted with its animations' first values.
+  - **Painting rules from the spec.** Text is unescaped and sized × `TEXT_SCALE`. With `light`, colours go through `lightPairs(colors)`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [ ] **Step 1: Write the failing tests.** Every test here is declared with `{ timeoutMs: 30000 }`:
 
 ```ts
 import { LayerCache, paintScene, pictureFor } from './paint/scene-paint'
 import { sceneOf } from './scene'
-import { GOLDEN_CASES, fingerprint } from './golden-cases'
+import { GOLDEN_CASES } from './golden-cases'
+import type { Board, Entry } from '../types'
 
+const SLOW = { timeoutMs: 30000 }
+const P12 = pictureFor(12)
 const P20 = pictureFor(20)
 const at = (name: string) => GOLDEN_CASES.find(g => g.name === name)!
-const scene = (name: string) => { const g = at(name); return sceneOf(g.board, g.now, setupFrom(g.options)) }
+const scene = (name: string, now?: number) => { const g = at(name); return sceneOf(g.board, now ?? g.now, setupFrom(g.options)) }
 const DARK_OPTS = { light: false, colors: {} }
 const inCore = (p = P20) => [Math.round(230 * p.scale), Math.round(182 * p.scale)] as const
 const ground = (p = P20) => [Math.round(4 * p.scale), Math.round(215 * p.scale)] as const
+const held = (lastAt: number): Board => ({
+  counts: { files: 1, shell: 1, web: 1 },
+  entries: (['files', 'shell', 'web'] as const).map((station, k): Entry => ({ id: `h${k}`, station, label: 'x', from: 'core', startedAt: lastAt - (2 - k) * 1000, endedAt: lastAt - (2 - k) * 1000 + 500, status: 'ok' })),
+})
+
+test('toStraight gives straight bytes and toBase64 encodes them', () => {
+  const c = new Canvas(2, 1)
+  fill(c, roundRect(0, 0, 1, 1, 0), parseColor('#ff0000'), 1)
+  const bytes = c.toStraight()
+  expect([...bytes]).toEqual([255, 0, 0, 255, 0, 0, 0, 0])
+  expect(c.toBase64()).toBe(bytes.toBase64())
+})
 
 test('the picture follows the pane: 408 to 1000 px tall, 34 px a row', () => {
   expect(pictureFor(20)).toEqual({ width: 727, height: 680, scale: 680 / 430 })
   expect(pictureFor(12).height).toBe(408)
   expect(pictureFor(40)).toEqual({ width: 1070, height: 1000, scale: 1000 / 430 })
-  const c = paintScene(scene('busy-default'), scene('busy-default').now, P20, DARK_OPTS)
-  expect([c.width, c.height]).toEqual([727, 680])
 })
 
-test('a cached frame equals an uncached one, at any size', () => {
-  for (const p of [pictureFor(12), P20, pictureFor(40)]) {
+test('a cached frame equals an uncached one', SLOW, () => {
+  for (const p of [P12, P20]) {
     const s = scene('busy-default')
     const cache = new LayerCache(p, DARK_OPTS)
-    for (const dt of [0, 130, 900]) expect(fingerprint(paintScene(s, s.now + dt, p, DARK_OPTS, cache).toBase64())).toBe(fingerprint(paintScene(s, s.now + dt, p, DARK_OPTS).toBase64()))
+    for (const dt of [0, 130]) expect(paintScene(s, s.now + dt, p, DARK_OPTS, cache).toBase64() === paintScene(s, s.now + dt, p, DARK_OPTS).toBase64()).toBe(true)
   }
 })
 
-test('after one station changes, only that station is repainted', () => {
+test('after a count changes, only that station and its spoke are repainted', SLOW, () => {
   const g = at('busy-default')
-  const cache = new LayerCache(P20, DARK_OPTS)
-  paintScene(sceneOf(g.board, g.now, setupFrom(g.options)), g.now, P20, DARK_OPTS, cache)
+  const cache = new LayerCache(P12, DARK_OPTS)
+  paintScene(sceneOf(g.board, g.now, setupFrom(g.options)), g.now, P12, DARK_OPTS, cache)
   const counted = { ...g.board, counts: { ...g.board.counts, skills: (g.board.counts.skills ?? 0) + 1 } }
-  paintScene(sceneOf(counted, g.now, setupFrom(g.options)), g.now, P20, DARK_OPTS, cache)
-  expect(cache.repainted.filter(k => k.startsWith('station:')).every(k => k.startsWith('station:skills'))).toBe(true)
-  expect(cache.repainted.some(k => k.startsWith('station:skills'))).toBe(true)
+  paintScene(sceneOf(counted, g.now, setupFrom(g.options)), g.now, P12, DARK_OPTS, cache)
+  const fresh = cache.repainted.filter(k => !k.startsWith('route') && !k.startsWith('motion'))
+  expect(fresh.some(k => k.startsWith('station:skills'))).toBe(true)
+  expect(fresh.every(k => k.startsWith('station:skills') || k.startsWith('spoke:skills'))).toBe(true)
+  expect(cache.repainted.some(k => k.startsWith('ground'))).toBe(false)
 })
 
-test('during the route hold nothing is repainted from frame to frame', () => {
-  const s = scene('t-route-40000-before')
-  const cache = new LayerCache(P20, DARK_OPTS)
-  paintScene(s, s.now, P20, DARK_OPTS, cache)
-  paintScene(s, s.now + 2000, P20, DARK_OPTS, cache)
+test('a route in its hold is painted once, then neither frames nor a rebuilt scene repaint it', SLOW, () => {
+  const now = 2_000_000
+  const cache = new LayerCache(P12, DARK_OPTS)
+  paintScene(sceneOf(held(now - 10_000), now, setupFrom({})), now, P12, DARK_OPTS, cache)
+  expect(cache.repainted.some(k => k.startsWith('route'))).toBe(true)
+  paintScene(sceneOf(held(now - 10_000), now, setupFrom({})), now + 2000, P12, DARK_OPTS, cache)
+  expect(cache.repainted.filter(k => k.startsWith('route'))).toEqual([])
+  paintScene(sceneOf(held(now - 10_000), now + 1000, setupFrom({})), now + 3000, P12, DARK_OPTS, cache)
   expect(cache.repainted.filter(k => k.startsWith('route'))).toEqual([])
 })
 
-test('the core is the node colour, the corners are clear, and transparent leaves the ground empty', () => {
+test('the cache keeps only the layers the last frame used', SLOW, () => {
+  const cache = new LayerCache(P12, DARK_OPTS)
+  const a = scene('busy-default')
+  paintScene(a, a.now, P12, DARK_OPTS, cache)
+  const used = cache.size
+  for (let k = 0; k < 5; k++) {
+    const g = at('busy-default')
+    const b = sceneOf({ ...g.board, counts: { ...g.board.counts, files: (g.board.counts.files ?? 0) + k + 1 } }, g.now, setupFrom(g.options))
+    paintScene(b, b.now, P12, DARK_OPTS, cache)
+  }
+  expect(cache.size).toBeLessThanOrEqual(used)
+})
+
+test('the core is the node colour, the corners are clear, and transparent leaves the ground empty', SLOW, () => {
   const s = scene('busy-default')
   const solid = paintScene(s, s.now, P20, DARK_OPTS)
   expect(solid.pixel(...inCore())).toEqual([18, 21, 28, 255])
@@ -355,48 +391,42 @@ test('the core is the node colour, the corners are clear, and transparent leaves
   expect(paintScene(clear, clear.now, P20, DARK_OPTS).pixel(...ground())[3]).toBe(0)
 })
 
-test('on a light terminal the painter remaps as desktop does, keeping colours of ones own', () => {
+test('on a light terminal the painter remaps as desktop does, keeping colours of ones own', SLOW, () => {
   const s = scene('busy-default')
-  expect(paintScene(s, s.now, P20, { light: true, colors: {} }).pixel(...inCore())).toEqual([255, 255, 255, 255])
+  expect(paintScene(s, s.now, P12, { light: true, colors: {} }).pixel(...inCore(P12))).toEqual([255, 255, 255, 255])
   const g = at('busy-default')
   const own = setupFrom({ colors: ['node=#123456'] })
   const mine = sceneOf(g.board, g.now, own)
-  expect(paintScene(mine, mine.now, P20, { light: true, colors: own.colors }).pixel(...inCore())).toEqual([18, 52, 86, 255])
+  expect(paintScene(mine, mine.now, P12, { light: true, colors: own.colors }).pixel(...inCore(P12))).toEqual([18, 52, 86, 255])
 })
 
-test('with nothing running the core does not breathe', () => {
+test('with nothing running the core does not breathe, and the cache repaints nothing between frames', SLOW, () => {
   const s = scene('board-idle-faded')
-  expect(fingerprint(paintScene(s, s.now, P20, DARK_OPTS).toBase64())).toBe(fingerprint(paintScene(s, s.now + 2400, P20, DARK_OPTS).toBase64()))
+  const cache = new LayerCache(P12, DARK_OPTS)
+  const a = paintScene(s, s.now, P12, DARK_OPTS, cache).toBase64()
+  expect(paintScene(s, s.now + 2400, P12, DARK_OPTS, cache).toBase64() === a).toBe(true)
+  expect(cache.repainted).toEqual([])
 })
 
-test('a fresh board, a board with no model and a core name outside the font all paint', () => {
-  for (const name of ['board-empty', 'board-no-model', 'setup-core-<&">']) expect(() => paintScene(scene(name), scene(name).now, P20, DARK_OPTS)).not.toThrow()
+test('a fresh board, a board with no model and a core name outside the font all paint', SLOW, () => {
+  for (const name of ['board-empty', 'board-no-model', 'setup-core-<&">']) expect(() => paintScene(scene(name), scene(name).now, P12, DARK_OPTS)).not.toThrow()
   const odd = sceneOf({ entries: [], counts: {} }, 0, setupFrom({ coreName: '日本🙂' }))
-  expect(() => paintScene(odd, 0, P20, DARK_OPTS)).not.toThrow()
-})
-
-test('budgets at R = 20: 7 ms a frame without change, 20 ms for the first after a one-station change', () => {
-  const g = at('busy-default')
-  const cache = new LayerCache(P20, DARK_OPTS)
-  const s = sceneOf(g.board, g.now, setupFrom(g.options))
-  paintScene(s, s.now, P20, DARK_OPTS, cache)
-  let start = performance.now()
-  for (let k = 1; k <= 20; k++) paintScene(s, s.now + k * 50, P20, DARK_OPTS, cache)
-  expect((performance.now() - start) / 20).toBeLessThan(7)
-  const counted = { ...g.board, counts: { ...g.board.counts, files: (g.board.counts.files ?? 0) + 1 } }
-  const s2 = sceneOf(counted, g.now + 1050, setupFrom(g.options))
-  start = performance.now()
-  paintScene(s2, s2.now, P20, DARK_OPTS, cache)
-  expect(performance.now() - start).toBeLessThan(20)
+  expect(() => paintScene(odd, 0, P12, DARK_OPTS)).not.toThrow()
 })
 ```
 
-  Group keys start with the group name: `station:<id>`, `route:<k>`, `ground`, `core`, and so on, as Task 6 assigns them.
+  `Canvas`, `parseColor`, `fill` and `roundRect` are already imported at the top of the file by Task 1's tests.
 - [ ] **Step 2: Run them to verify they fail.** Run `claude plugin test . 2>&1 | grep -E "\((pass|fail)\)"`. Expected: `paint.test.ts` fails to load (no `./paint/scene-paint`).
-- [ ] **Step 3: Implement `hooks/paint/scene-paint.ts`.**
-- [ ] **Step 4: Run the whole suite.** Run `claude plugin test .`. Expected: all pass. If only a budget test fails, report the measured numbers as DONE_WITH_CONCERNS; the controller takes them to the person.
-- [ ] **Step 5: Look at a frame.** Add `bun scripts/golden.ts png <name> [rows]`, which writes `scripts/golden-out/<name>-<rows>.png` with `node:zlib`. Write `busy-default` at 20 and 40 rows and `setup-theme-light` at 20, and view each beside its SVG. Expected: the same picture apart from anti-aliasing.
-- [ ] **Step 6: Commit:** `git add hooks/paint/scene-paint.ts hooks/paint.test.ts scripts/golden.ts && git commit -m "Paint the map's scene as pixels, sized to the pane, with cached layers"`
+- [ ] **Step 3: Implement** `toStraight` in `canvas.ts`, and `hooks/paint/scene-paint.ts`.
+- [ ] **Step 4: Run the whole suite.** Run `claude plugin test .`. Expected: all pass.
+- [ ] **Step 5: Write `scripts/bench.ts`** and run it with `bun scripts/bench.ts`. It warms up 10 frames of `busy-default` at `pictureFor(20)`, then prints:
+  - the average ms of 40 frames with no board change;
+  - the ms of the first frame after bumping `counts.files`;
+  - the same two at `pictureFor(40)`.
+
+  Expected: ≤ 7 ms and ≤ 20 ms at 20 rows. Over budget is reported as DONE_WITH_CONCERNS with the numbers; it never becomes a failing test.
+- [ ] **Step 6: Look at a frame.** Add `bun scripts/golden.ts png <name> [rows]`, which writes `scripts/golden-out/<name>-<rows>.png` with `node:zlib`. Write `busy-default` at 20 and 40 rows and `setup-theme-light` at 20, and view each beside its SVG. Expected: the same picture apart from anti-aliasing.
+- [ ] **Step 7: Commit:** `git add hooks/paint/canvas.ts hooks/paint/scene-paint.ts hooks/paint.test.ts scripts/golden.ts scripts/bench.ts && git commit -m "Paint the map's scene as pixels, sized to the pane, with cached layers"`
 
 ### Task 9: The motion query
 
@@ -417,11 +447,10 @@ test('budgets at R = 20: 7 ms a frame without change, 20 ms for the first after 
   - 1 instead of 15 or 20 once `t − boardChangedAt ≥ IDLE_CAP_MS`.
   - With fps 0, `wakeAt` is the earliest window `from` after t, absent if none.
 
-- [ ] **Step 1: Write the failing tests.** These are the tests from plan revision 1's Task 9, with the rates changed to 20 and 15:
+- [ ] **Step 1: Write the failing tests** (`Board` and `Entry` are already imported from Task 8):
 
 ```ts
 import { IDLE_CAP_MS, changedAt, motionAt } from './paint/motion'
-import type { Board, Entry } from '../types'
 
 const NOW = 1_000_000
 let seq = 0
@@ -472,26 +501,24 @@ test('a fresh session is still', () => {
 - Test: `hooks/terminal.test.tsx`
 
 **Interfaces:**
-- Consumes: nothing beyond the standard library.
 - Produces, all pure (no `$`):
   - `CELL_RATIO = 2.1`, `MIN_RING_ROWS = 12`;
   - `ringBox(bodyRows: number, bodyColumns: number): { columns: number; rows: number } | undefined`;
   - `type Env = Readonly<Record<string, string | undefined>>`;
-  - `ENV_NAMES = ['TERM_PROGRAM', 'TERM', 'KITTY_WINDOW_ID', 'TMUX', 'ZELLIJ', 'STY', 'SSH_CONNECTION', 'SSH_TTY', 'TMPDIR', 'HOME'] as const`. `$.env.get` takes literals only, so register.tsx reads each by name.
-  - `terminalAllows(env: Env): boolean`, the allow-list in Global Constraints;
+  - `ENV_NAMES = ['TERM_PROGRAM', 'TERM', 'KITTY_WINDOW_ID', 'TMUX', 'ZELLIJ', 'STY', 'SSH_CONNECTION', 'SSH_TTY', 'TMPDIR', 'HOME'] as const`. register.tsx reads each with a literal `$.env.get('…')`.
+  - `terminalAllows(env: Env): boolean`;
   - `socketPath(env: Env, tag: string): string`;
   - `newTag(random: () => number): string`, 8 characters of `[a-z0-9]`;
   - `type Refusal = { next: 'text' } | { next: 'pause' } | { next: 'carry-on' }`;
-  - `class PictureGate { accepted(now: number): void; refused(deny: string, now: number): Refusal; rendered(now: number): void; showsPicture(): boolean }`;
+  - `class PictureGate { accepted(now: number): void; refused(deny: string, now: number): Refusal; rendered(now: number): { reopen: boolean }; showsPicture(): boolean }`;
   - `class HelperPolicy { exited(now: number): { restartIn: number } | { giveUp: true } }`, restarting after 1000 and 5000 ms and giving up on the third exit within 60 000 ms;
-  - `class Coalescer<T> { offer(value: T, now: number): T | undefined; due(now: number): T | undefined }`, at most one value per 100 ms with the newest winning;
-  - `type HelperLine = { kind: 'R' } | { kind: 'F'; name: string; width: number; height: number } | { kind: 'S'; text: string } | { kind: 'E'; message: string }`;
+  - `class Coalescer<T> { offer(value: T, now: number): T | undefined; due(now: number): T | undefined; waitMs(now: number): number | undefined }`. At most one value per 100 ms, the newest winning. `waitMs` says when a pending value becomes due, so the caller can arm a timer.
+  - `type HelperLine = { kind: 'R' } | { kind: 'F'; name: string; width: number; height: number; generation: number } | { kind: 'S'; text: string } | { kind: 'E'; message: string }`;
   - `class LineReader { push(piece: string): HelperLine[] }`, which reassembles lines across pieces and drops malformed ones.
 - Gate rules:
   - **Before any blit is accepted:** an alt refusal, followed by another at least 2000 ms later, → `text`.
-  - **After an accepted blit:** an alt refusal → `pause`; it never switches to text.
-  - **Not mounted** → `pause`. **The start-up capability message** → `carry-on`. **Anything else** → `carry-on`.
-  - **A render at least 60 000 ms after a switch to text** makes `showsPicture()` true again.
+  - **After an accepted blit:** an alt refusal → `pause`. **Not mounted** → `pause`. **The start-up capability message** and anything else → `carry-on`.
+  - **Reopening:** `rendered(now)` at least 60 000 ms after a switch to text returns `{ reopen: true }` and makes `showsPicture()` true. The caller then starts a fresh helper; this does not count toward `HelperPolicy`.
 
 - [ ] **Step 1: Write the failing tests** in `hooks/terminal.test.tsx`:
 
@@ -526,16 +553,16 @@ test('the socket path stays under 100 bytes, in TMPDIR when it fits and /tmp oth
   expect(newTag(() => 0.5)).toMatch(/^[a-z0-9]{8}$/)
 })
 
-test('two alt refusals two seconds apart switch to text; a render a minute later tries again', () => {
+test('two alt refusals two seconds apart switch to text; a render a minute later reopens', () => {
   const g = new PictureGate()
-  g.rendered(0)
+  expect(g.rendered(0)).toEqual({ reopen: false })
   expect(g.refused(ALT, 100)).toEqual({ next: 'carry-on' })
   expect(g.refused(ALT, 1100)).toEqual({ next: 'carry-on' })
   expect(g.refused(ALT, 2200)).toEqual({ next: 'text' })
   expect(g.showsPicture()).toBe(false)
-  g.rendered(30_000)
+  expect(g.rendered(30_000)).toEqual({ reopen: false })
   expect(g.showsPicture()).toBe(false)
-  g.rendered(62_300)
+  expect(g.rendered(62_300)).toEqual({ reopen: true })
   expect(g.showsPicture()).toBe(true)
 })
 
@@ -556,21 +583,23 @@ test('a helper that keeps dying is restarted twice, then given up on', () => {
   expect([q.exited(0), q.exited(70_000)]).toEqual([{ restartIn: 1000 }, { restartIn: 1000 }])
 })
 
-test('board posts are at most ten a second, the newest winning', () => {
+test('board posts are at most ten a second, the newest winning, and say when the next is due', () => {
   const c = new Coalescer<number>()
   expect(c.offer(1, 0)).toBe(1)
   expect(c.offer(2, 30)).toBeUndefined()
   expect(c.offer(3, 60)).toBeUndefined()
+  expect(c.waitMs(60)).toBe(40)
   expect(c.due(90)).toBeUndefined()
   expect(c.due(100)).toBe(3)
   expect(c.due(150)).toBeUndefined()
+  expect(c.waitMs(150)).toBeUndefined()
 })
 
 test('helper lines are read across pieces and malformed ones are dropped', () => {
   const r = new LineReader()
   expect(r.push('R\nF /lm-abcd1234-0 72')).toEqual([{ kind: 'R' }])
-  expect(r.push('7 680\nS 20 6.6 0.3 0\nnonsense\nF bad\nE no cc\n')).toEqual([
-    { kind: 'F', name: '/lm-abcd1234-0', width: 727, height: 680 },
+  expect(r.push('7 680 41\nS 20 6.6 0.3 0\nnonsense\nF bad\nE no cc\n')).toEqual([
+    { kind: 'F', name: '/lm-abcd1234-0', width: 727, height: 680, generation: 41 },
     { kind: 'S', text: '20 6.6 0.3 0' },
     { kind: 'E', message: 'no cc' },
   ])
@@ -592,31 +621,48 @@ test('helper lines are read across pieces and malformed ones are dropped', () =>
   - `helper/loop.ts`;
   - `helper/server.ts`;
   - `helper/painter.ts`, the entry point;
+  - `helper/feed.ts`, a hand-check reader;
   - `helper/*.spec.ts`.
-- Reference: the spike's `/Users/froch/.claude/dev-mods/4e805010-94ea-4bde-a455-ed356869fa4a/ring-test/helper/painter.ts` and `shm.c`, and its report `.superpowers/sdd/2026-11-12-terminal-ring/spike-shm-report.md`.
+- Reference: the spike's `ring-test/helper/painter.ts` and `shm.c` (in the dev-mods folder), and `.superpowers/sdd/2026-11-12-terminal-ring/spike-shm-report.md`.
 
 **Interfaces:**
-- Consumes: `sceneOf` (Task 6), `paintScene`, `LayerCache`, `pictureFor` (Task 8), `motionAt` and `changedAt` (Task 9), `setupFrom` (map.ts).
+- Consumes:
+  - `sceneOf` (Task 6), `setupFrom` (map.ts);
+  - `paintScene`, `LayerCache`, `pictureFor`, `Canvas.toStraight` (Task 8);
+  - `motionAt`, `changedAt` (Task 9).
 - Produces:
-  - `helper/shm.ts`: `type Shm = { put(name: string, bytes: Uint8Array): number; drop(name: string): number; read(name: string, length: number): Uint8Array | undefined }`, and `loadShm(): Shm`. It compiles `shm.c` with `cc` from `bun:ffi`, and throws if `cc` fails. `put` returns 0 or −errno, with −EEXIST when the name is still unread. `read` exists for tests.
-  - `helper/ring.ts`: `class NameRing { constructor(tag: string, shm: Shm, size = 8); clean(): void; write(bytes: Uint8Array, now: number): string | undefined; expire(now: number): number }`.
-    - `write` tries each name from the next index. `undefined` means all are unread: backpressure, so skip the frame.
+  - `helper/shm.ts`: `type Shm = { put(name: string, bytes: Uint8Array): number; drop(name: string): number; read(name: string, length: number): Uint8Array | undefined }`, and `loadShm(): Shm`.
+    - It compiles `shm.c` with `cc` from `bun:ffi`, and throws if `cc` fails.
+    - `put` returns 0, or −errno: −EEXIST (−17) while the name is unread.
+    - `read` exists for tests and the feed reader.
+  - `helper/ring.ts`: `class NameRing { constructor(tag: string, shm: Shm, size = 8); clean(): void; write(bytes: Uint8Array, now: number): { name: string; generation: number } | undefined; expire(now: number): number }`.
+    - `write` tries each name from the next index and numbers frames with a running generation. `undefined` means all are unread: backpressure, so skip the frame.
     - `expire` drops names written more than 1000 ms ago that are still unread.
-  - `helper/loop.ts`: `class FrameLoop { constructor(deps: { now: () => number; paint: (t: number) => Uint8Array; write: (bytes: Uint8Array, t: number) => string | undefined; emit: (line: string) => void; schedule: (ms: number, fn: () => void) => void }); setBoard(board: Board, now: number, changedAt: number): void; setSetup(setup: HelperSetup): void; pause(): void; resume(): void; stats(): HelperStats }`.
-    - It runs at `motionAt`'s rate, drift-corrected, and emits `F` lines and an `S` line each second.
-    - Clocks: it samples at `deps.now()`. When that differs from the board's posted `now` by more than 1000 ms, it applies the offset fixed at that post.
-    - It sleeps at fps 0 until `wakeAt`, a new board or `resume`.
-    - It paints one last frame when the fps falls to 0.
-  - `helper/server.ts`: `serve(path: string, loop: FrameLoop): { stop(): void }`, built on `Bun.serve({ unix })`. It handles:
-    - `POST /setup` with `{ options, light, rows }`;
-    - `POST /board` with `{ board, now, changedAt }`;
-    - `POST /pause`, `POST /resume`;
-    - `POST /stats`, which returns JSON.
+  - `helper/loop.ts`:
+    - `type HelperSetup = { options: Record<string, unknown>; light: boolean; rows: number }`;
+    - `type HelperStats = { state: 'running' | 'still' | 'paused'; frames: number; skips: number; expired: number; paintMs: number; shmMs: number }`;
+    - `class FrameLoop { constructor(deps: { now: () => number; paint: (scene: Scene, t: number, picture: Picture, options: PaintOptions) => Uint8Array; write: (bytes: Uint8Array, now: number) => { name: string; generation: number } | undefined; expire: (now: number) => number; emit: (line: string) => void; schedule: (ms: number, fn: () => void) => () => void }); setBoard(board: Board, now: number, changedAt: number): void; setSetup(setup: HelperSetup): void; pause(): void; resume(): void; stats(): HelperStats }`.
+  - Loop rules:
+    - **Scene.** It builds the scene with `sceneOf(board, postedNow, setupFrom(options))`. It samples at `deps.now()`, or, when that differs from the posted `now` by more than 1000 ms, at `deps.now()` plus the offset fixed at that post.
+    - **Rate.** It runs at `motionAt`'s fps, drift-corrected. Each new board cancels the pending timer and re-plans.
+    - **Painting even when still.** It paints one frame:
+      - when the fps falls to 0 (the last frame);
+      - on `resume()` and on `setSetup()`, so a pane shown again while still gets a fresh frame.
+    - **Sleeping.** At 0 fps it sleeps until `wakeAt`, a new board, or `resume`, and schedules one `expire` 1100 ms after its last frame.
+    - **Output.** It emits `F <name> <width> <height> <generation>` for each frame, and `S …` once a second only while frames flow.
+  - `helper/server.ts`:
+    - `prepareSocket(path: string): void` creates the directory with mode 0700 and removes a stale socket file.
+    - `serve(path: string, loop: FrameLoop): { stop(): void }` is built on `Bun.serve({ unix })` and handles:
+      - `POST /setup` with a `HelperSetup`;
+      - `POST /board` with `{ board, now, changedAt }`;
+      - `POST /pause`, `POST /resume`;
+      - `POST /stats`, which returns `HelperStats` as JSON.
 
-    Anything else answers 404. A malformed body answers 400 and changes nothing.
+      Anything else answers 404. A malformed body answers 400 and changes nothing.
   - `helper/painter.ts`: run as `bun helper/painter.ts <socket path> <tag>`.
-    - **Starting:** it creates the socket's directory with mode 0700 and removes a stale socket. It loads the shim; if that fails it prints `E` and exits 2. It cleans the ring, serves, and prints `R`.
-    - **Stopping:** on SIGTERM or SIGINT, or when stdout or stdin closes because the parent died, it unlinks unread names, removes the socket, and exits.
+    - **Starting:** `prepareSocket`, `loadShm` (on failure print `E …` and exit 2), `ring.clean()`, `serve`, then print `R`.
+    - **Stopping:** on SIGTERM, SIGINT, SIGHUP or SIGPIPE, on an error writing stdout, or when a 2 s poll finds `process.ppid === 1`, it unlinks unread names, stops the server, removes the socket and exits. It never reads stdin.
+  - `helper/feed.ts`: `bun helper/feed.ts`. It reads `F` lines on stdin and, for each, reads and drops the name, as a terminal would. It counts frames a second, for the hand check.
 
 - [ ] **Step 1: Write the failing specs:**
 
@@ -636,15 +682,16 @@ const fakeShm = () => {
   return { shm, live }
 }
 
-test('frames go round eight names; when all eight are unread the frame is skipped', () => {
+test('frames go round eight names with rising generations; all eight unread skips the frame', () => {
   const { shm, live } = fakeShm()
   const ring = new NameRing('abcd1234', shm)
-  const names = Array.from({ length: 8 }, (_, k) => ring.write(new Uint8Array([k]), k))
-  expect(new Set(names).size).toBe(8)
-  expect(names.every(n => /^\/lm-abcd1234-[0-7]$/.test(n!))).toBe(true)
+  const written = Array.from({ length: 8 }, (_, k) => ring.write(new Uint8Array([k]), k)!)
+  expect(new Set(written.map(w => w.name)).size).toBe(8)
+  expect(written.every(w => /^\/lm-abcd1234-[0-7]$/.test(w.name))).toBe(true)
+  expect(written.map(w => w.generation)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
   expect(ring.write(new Uint8Array([9]), 9)).toBeUndefined()
-  live.delete(names[3]!)
-  expect(ring.write(new Uint8Array([10]), 10)).toBe(names[3])
+  live.delete(written[3]!.name)
+  expect(ring.write(new Uint8Array([10]), 10)).toEqual({ name: written[3]!.name, generation: 9 })
 })
 
 test('clean drops all eight names, and expire drops frames unread after a second', () => {
@@ -659,122 +706,175 @@ test('clean drops all eight names, and expire drops frames unread after a second
 })
 ```
 
-```ts
-// helper/loop.spec.ts — the schedule against a fake clock
-import { expect, test } from 'bun:test'
-import { FrameLoop } from './loop'
-// Build a fake clock whose schedule() queues callbacks, advance it, and count emitted F lines:
-// a fresh call → about 20 F lines in 1000 ms; a long-running call → about 15;
-// an idle board → 0 after a last frame; a stuck run with changedAt 300 000 ms back → about 1 a second.
-```
-
-  Write `loop.spec.ts` with those four assertions, each with a ±1 tolerance on counts, using the board helpers from Task 9's tests copied into the spec. Write `server.spec.ts`: start `serve` on a socket under the OS temp directory; POST `/setup`, `/board` and `/pause` with `fetch(url, { unix })`; assert the loop received them, that a malformed body gets 400, and that `/stats` returns JSON. Write `shm.spec.ts`: `loadShm()`, `put` then `read` returns the same bytes, a second `put` returns −17, `drop` then `read` returns `undefined`.
+  Write the other three specs with these assertions:
+  - **`helper/loop.spec.ts`**, with a fake clock whose `schedule` queues callbacks and returns a canceller, and `paint` returning a 4-byte array. Use the Task 9 board helpers, copied in. Counts are ±1.
+    - A fresh call emits about 20 `F` lines in 1000 ms.
+    - A long-running call emits about 15.
+    - An idle board emits exactly one last frame, then nothing for 5000 ms.
+    - A stuck run with `changedAt` 300 000 ms back emits about one a second.
+    - `resume()` while still emits one frame.
+    - A board posted with `now` 5000 ms behind the fake clock samples at the fake clock minus 5000 (check through the scene's `now`).
+    - `S` lines appear while frames flow and not while still.
+  - **`helper/server.spec.ts`:**
+    - `prepareSocket` makes the directory with mode 0700 and removes a stale file.
+    - Start `serve` under `os.tmpdir()`, then POST `/setup`, `/board` and `/pause` with `fetch(url, { unix })`, and assert the loop received them.
+    - A malformed body gets 400; `/stats` returns JSON.
+  - **`helper/shm.spec.ts`:** `loadShm()`; `put` then `read` returns the same bytes; a second `put` returns −17; `drop` then `read` returns `undefined`.
 - [ ] **Step 2: Run them to verify they fail.** Run `bun test helper`. Expected: the module imports fail.
-- [ ] **Step 3: Implement `shm.c`, `shm.ts`, `ring.ts`, `loop.ts`, `server.ts` and `painter.ts`.** Start from the spike's shim, which compiled with `cc` here.
+- [ ] **Step 3: Implement** `shm.c`, `shm.ts`, `ring.ts`, `loop.ts`, `server.ts`, `painter.ts` and `feed.ts`. Start from the spike's shim, which compiled with `cc` here.
 - [ ] **Step 4: Run the specs.** Run `bun test helper`. Expected: all pass.
-- [ ] **Step 5: Run it end to end, by hand.**
-  - Start `bun helper/painter.ts /tmp/lot-map-test0001/h.sock test0001 | head -40` in the background.
-  - POST a `/setup` (`rows: 20`) and the busy golden board with `curl --unix-socket`.
-  - Check: `R` arrives first, then `F` lines at about 20 a second, and `S` lines show a paint of 7 ms or less.
-  - Kill it with SIGTERM and confirm that `read` of each `/lm-test0001-k` returns `undefined` afterwards.
-  - Write the commands and output into the report.
+- [ ] **Step 5: Run it end to end, by hand,** and write the commands and output into the report.
+  1. Run `bun helper/painter.ts /tmp/lot-map-test0001/h.sock test0001 > /tmp/lm-out.txt &` and then `tail -f /tmp/lm-out.txt | bun helper/feed.ts &`.
+  2. POST `/setup` (`rows: 20`) and the busy golden board with `curl --unix-socket /tmp/lot-map-test0001/h.sock`.
+  3. Expected: `R` first, then the feed counts about 20 frames a second, and `S` shows a paint of 7 ms or less.
+  4. Send SIGTERM. Expected: none of the 8 `/lm-test0001-k` names can be read.
+  5. Start it again, then `kill -9` it while frames flow. Start it once more with the same tag. Expected: after its `R`, none of the earlier names can be read.
 - [ ] **Step 6: Commit:** `git add helper && git commit -m "Add the helper that paints the terminal map into shared memory"`
 
 ### Task 12: Wiring the plugin to the helper
 
 **Files:**
 - Modify:
-  - `hooks/register.tsx` (the Pane `ui.render` hook, `session.start`, a `config.set` hook, the `lot-map` command);
+  - `hooks/register.tsx` (the Pane `ui.render` hook, a `config.set` hook, the `lot-map` command);
   - `hooks/map.ts` (`Setup.terminal`, `setupFrom`);
-  - `hooks/text.ts` (one string per language for `/lot-map stats`);
+  - `hooks/text.ts` (one string per language for `/lot-map stats`, and one for the toast when the socket is refused);
   - `.claude-plugin/plugin.json` (the option);
   - `types/index.d.ts` (the tag in `PluginState`).
+- Modify (Step 1 only): the throwaway `ring-test` mod.
 - Test: `hooks/terminal.test.tsx`
 
 **Interfaces:**
-- Consumes: `ringBox`, `terminalAllows`, `ENV_NAMES`, `socketPath`, `newTag`, `PictureGate`, `HelperPolicy`, `Coalescer`, `LineReader` (Task 10); `pictureFor` (Task 8); `changedAt` (Task 9).
+- Consumes: Task 10's exports; `pictureFor` (Task 8); `changedAt` (Task 9).
 - Produces:
   - `Setup.terminal: 'picture' | 'text'`, where anything but `'text'` is `'picture'`;
   - the `userConfig` field `terminal`: `{ "type": "string", "title": "In the terminal", "options": ["picture", "text"], "default": "picture", "description": "How the map shows in a terminal: as a moving picture in Ghostty or kitty (needs bun; uses shared memory and a local socket), or as text." }`;
-  - a state atom `{ plugin: 'lot-map', key: 'tag' }` holding the session tag;
+  - the state atom `{ plugin: 'lot-map', key: 'tag' }`;
   - `/lot-map stats`, which answers `{ text }` with:
-    - picture or text mode and why;
+    - a first line `mode: picture` or `mode: text (<reason>)`;
+    - `frames: <n> taken · <m> refused`, followed by the refusal texts;
     - the helper's state and restarts;
-    - frames taken and refused, with refusal texts;
-    - the average and p95 blit ms;
+    - blit ms average and p95;
     - the helper's last `S` line;
     - board posts sent and coalesced.
+- **Where things happen:**
+  - **The render hook** (terminal surface) is the one place that decides the mode and starts the helper, the first time picture mode applies. It also posts boards, because it re-runs on every board write.
+    - It offers each new board to the `Coalescer` with `now` and `changedAt`.
+    - When `offer` returns undefined, it arms `$.clock.after(waitMs)` in its closure (once per pending value) to flush `due()`.
+    - It also posts `/resume` when the pane was paused, and `/setup` when `rows` or `light` changed.
+  - **The stdout loop** lives in a closure written in the render hook, for the session's life. If Step 1 shows that does not survive, it moves to `session.start`'s closure.
+  - **`light`** is `setup.theme === 'auto' && themeRow.startsWith('light')`. With an explicit `light` or `dark`, the scene is already in that palette.
+  - **The theme row** is read on the first render and in a `config.set` hook on `{ key: 'theme' }`, which then posts `/setup` and invalidates.
+  - **A refused or failing `$.http.fetch`** gives the text view and one `$.ui.toast` naming the cause. The helper is stopped.
 
-- [ ] **Step 1: Check the three spike gaps in Ghostty first.** This is a checkpoint with the person. Add `/ring-test probe` to the ring-test mod. It:
-  - starts a tiny bun server on a unix socket and sends one `$.http.fetch(…, { socketPath })` to it, reporting the result;
-  - spawns the spike helper from inside a `ui.render` hook's closure, and after 10 s reports whether it is still alive and blitting;
-  - mounts the Image with a 1×1 ground placeholder, then blits 727×680 shm frames, reporting the refusals.
+- [ ] **Step 1: Check the spike gaps in Ghostty first.** This is a checkpoint with the person. Change the ring-test spike so it sends frames as Task 11 will:
+  - 727×680;
+  - a ring of 8 reused names;
+  - `F name w h generation`;
+  - blits that carry `generation`;
+  - a bun unix-socket server in its helper.
 
-  The person runs it in Ghostty and pastes `/ring-test stats`. For each check that fails, apply the spec's fallback and record it in the ledger before Step 2.
-- [ ] **Step 2: Write the failing tests,** appended to `hooks/terminal.test.tsx`:
+  Then add `/ring-test probe`, which reports each of these:
+  - one `$.http.fetch(…, { socketPath })` round trip;
+  - a helper spawned from inside a `ui.render` hook's closure still alive and blitting after 10 s;
+  - the Image mounted with a 1×1 ground placeholder, then 727×680 frames;
+  - 30 s of frames on the 8 reused names, with any refusals or dropped frames;
+  - the pane hidden and shown again while the map is still: a frame appears, not a blank box.
+
+  The person runs it in Ghostty and pastes `/ring-test stats`. For each check that fails, apply the spec's fallback and ledger it before Step 2.
+- [ ] **Step 2: Write the failing tests,** appended to `hooks/terminal.test.tsx`. Every test here uses `{ timeoutMs: 30000 }`:
 
 ```ts
+const SLOW = { timeoutMs: 30000 }
 const DOCK = { title: 'Map', isFocused: false, bodyColumns: 89, placement: 'dock', scroll: { offset: 0, bodyRows: 34 }, view: {} } as const
 const PANE = { plugin: 'lot-map', component: 'Pane', requestId: 'lot-map', props: DOCK } as const
 const GHOSTTY = { TERM_PROGRAM: 'ghostty', TMPDIR: '/var/folders/ab/cdefgh/T/', HOME: '/Users/x' }
+const path = (p: { url: string }) => new URL(p.url).pathname
 
-/** A world with a fake helper: it prints R, then F lines whenever told to. */
-const world = (on: On, env: Record<string, string> = GHOSTTY, blit: (n: number) => { deny?: string } = () => ({})) => {
+type Spawn = (feed: (line: string) => void) => AsyncGenerator<{ stream: 'stdout'; text: string }, { value: { code: number | null; signal: string | null } }>
+
+/** A world with a fake helper that prints R, then F lines when told to. */
+const world = (on: On, opts: { env?: Record<string, string>; blit?: (n: number) => { deny?: string }; bun?: boolean; fetchOk?: boolean; spawn?: Spawn; theme?: { value: string } } = {}) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  mock.env(on, env)
+  mock.env(on, opts.env ?? GHOSTTY)
   const spawned: string[][] = []
   const posts: { url: string; body: unknown }[] = []
-  const blits: { name: string; at: number }[] = []
-  let feed: ((line: string) => void) | undefined
-  on('process.spawn', async function* (_, e) {
-    spawned.push([...e.argv])
+  const blits: { name: string; generation: number; at: number }[] = []
+  let stopped = 0
+  let feed: (line: string) => void = () => {}
+  const standard: Spawn = async function* (push) {
     const lines: string[] = ['R\n']
     let wake: (() => void) | undefined
     feed = line => { lines.push(line); wake?.() }
-    while (true) {
-      while (lines.length > 0) yield { stream: 'stdout', text: lines.shift()! }
-      await new Promise<void>(r => { wake = r })
-    }
+    try {
+      while (true) {
+        while (lines.length > 0) yield { stream: 'stdout', text: lines.shift()! }
+        await new Promise<void>(r => { wake = r })
+      }
+    } finally { stopped++ }
+  }
+  on('process.run', () => (opts.bun === false ? { deny: 'not found' } : { value: { exitCode: 0, stdout: '1.4.4\n', stderr: '' } }))
+  on('fs.exists', () => ({ value: opts.bun !== false }))
+  on('process.spawn', (_, e) => { spawned.push([...e.argv]); return (opts.spawn ?? standard)(line => feed(line)) })
+  on('http.fetch', (_, e) => {
+    posts.push({ url: e.url, body: JSON.parse(String(e.init?.body ?? 'null')) })
+    return opts.fetchOk === false ? { deny: 'refused by policy' } : { value: { status: 200, ok: true, headers: {}, text: '{}' } }
   })
-  on('http.fetch', (_, e) => { posts.push({ url: e.url, body: JSON.parse(String(e.init?.body ?? 'null')) }); return { value: { status: 200, ok: true, headers: {}, text: '{}' } } })
-  on('ui.blit', (_, e) => { const name = (e.source as { shm: string }).shm; blits.push({ name, at: clock.now() }); return { value: blit(blits.length) } })
-  on('config.list', () => ({ value: [] }))
+  on('ui.blit', (_, e) => { const s = e.source as { shm: string; generation: number }; blits.push({ name: s.shm, generation: s.generation, at: clock.now() }); return { value: opts.blit?.(blits.length) ?? {} } })
+  on('config.list', () => ({ value: opts.theme === undefined ? [] : [{ key: 'theme', label: 'Theme', kind: 'choice', value: opts.theme.value, provider: { kind: 'engine' }, isLocked: false }] }))
+  on('config.set', (_, e) => { if (opts.theme !== undefined) opts.theme.value = String(e.value); return { value: e.value } })
   on('tool.call', () => ({ result: {} }))
-  return { clock, spawned, posts, blits, frame: (k: number) => feed?.(`F /lm-abcd1234-${k % 8} 727 680\n`) }
+  return { clock, spawned, posts, blits, stopped: () => stopped, frame: (k: number) => feed(`F /lm-abcd1234-${k % 8} 727 680 ${k + 1}\n`) }
 }
 
-test('in Ghostty the pane starts one helper, posts setup and board, and relays its frames', async ($, on) => {
+test('in Ghostty the pane starts one helper, posts setup and board, and relays frames with their generation', SLOW, async ($, on) => {
   const w = world(on)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await w.clock.settle()
   expect(w.spawned.length).toBe(1)
-  expect(w.spawned[0]!.slice(-2)).toEqual(['/var/folders/ab/cdefgh/T/lot-map-' + w.spawned[0]!.at(-1) + '/h.sock', w.spawned[0]!.at(-1)])
-  expect(w.posts.map(p => new URL(p.url).pathname)).toEqual(['/setup', '/board'])
+  const tag = w.spawned[0]!.at(-1)!
+  expect(w.spawned[0]!.at(-2)).toBe(`/var/folders/ab/cdefgh/T/lot-map-${tag}/h.sock`)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  expect(((await ui.find({ type: 'Image' }))!.props.source as { width: number }).width).toBe(1)
   w.frame(0); w.frame(1)
   await w.clock.settle()
-  expect(w.blits.map(b => b.name)).toEqual(['/lm-abcd1234-0', '/lm-abcd1234-1'])
+  expect(w.blits.map(b => [b.name, b.generation])).toEqual([['/lm-abcd1234-0', 1], ['/lm-abcd1234-1', 2]])
+  await ui.redraw()
   const image = await ui.find({ type: 'Image' })
-  expect(image?.props).toMatchObject({ key: 'map', columns: 45, rows: 20 })
+  expect(image?.props).toMatchObject({ key: 'map', columns: 45, rows: 20, source: { shm: '/lm-abcd1234-1', width: 727, height: 680 } })
 })
 
-test('iTerm2, tmux, the text option and desktop start no helper and show no picture', { options: {} }, async ($, on) => {
-  for (const env of [{ TERM_PROGRAM: 'iTerm.app' }, { ...GHOSTTY, TMUX: '/tmp/t' }]) {
-    const w = world(on, env)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+test('iTerm2 starts no helper and shows no picture', SLOW, async ($, on) => {
+  const w = world(on, { env: { TERM_PROGRAM: 'iTerm.app' } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.spawned.length).toBe(0)
+})
+
+test('tmux starts no helper and shows no picture', SLOW, async ($, on) => {
+  const w = world(on, { env: { ...GHOSTTY, TMUX: '/tmp/t' } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.spawned.length).toBe(0)
+})
+
+test('an inline pane, a short pane and a machine without bun show the text view', SLOW, async ($, on) => {
+  const w = world(on, { bun: false })
+  for (const props of [{ ...DOCK, placement: 'inline' }, { ...DOCK, scroll: { offset: 0, bodyRows: 19 } }, DOCK]) {
+    const ui = await $.ui.mount({ ...PANE, props, surface: 'terminal' } as never)
     expect(await ui.find({ type: 'Image' })).toBeUndefined()
-    expect(w.spawned.length).toBe(0)
     await ui.unmount()
   }
+  expect(w.spawned.length).toBe(0)
 })
 
-test('with terminal set to text the pane draws todays text view', { options: { terminal: 'text' } }, async ($, on) => {
+test('with terminal set to text the pane draws todays text view', { ...SLOW, options: { terminal: 'text' } }, async ($, on) => {
   const w = world(on)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Image' })).toBeUndefined()
   expect(w.spawned.length).toBe(0)
 })
 
-test('the feed is cut to fit under the picture, every row one line long', async ($, on) => {
+test('the feed is cut to fit under the picture, every row one line long', SLOW, async ($, on) => {
   world(on)
   for (let k = 0; k < 20; k++) {
     if (k % 2 === 0) await $.tool.call({ tool: 'Read', file_path: `/a/${k}/${'p'.repeat(120)}.ts` })
@@ -789,8 +889,8 @@ test('the feed is cut to fit under the picture, every row one line long', async 
   }
 })
 
-test('two alt refusals two seconds apart stop the helper and show text by themselves', async ($, on) => {
-  const w = world(on, GHOSTTY, () => ({ deny: 'the Image draws its alt here: no images' }))
+test('two alt refusals two seconds apart stop the helper and show text by themselves', SLOW, async ($, on) => {
+  const w = world(on, { blit: () => ({ deny: 'the Image draws its alt here: no images' }) })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await w.clock.settle()
   w.frame(0)
@@ -798,40 +898,75 @@ test('two alt refusals two seconds apart stop the helper and show text by themse
   w.frame(1)
   await w.clock.settle()
   expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  w.frame(2) // wakes the fake helper so its loop can see it was ended
+  await w.clock.settle()
+  expect(w.stopped()).toBe(1)
 })
 
-test('a not-mounted refusal pauses the helper, and the next render resumes it', async ($, on) => {
-  const w = world(on, GHOSTTY, n => (n === 2 ? { deny: 'no Image of its own is mounted under key map' } : {}))
+test('a not-mounted refusal pauses the helper, and the next render resumes it', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n === 2 ? { deny: 'no Image of its own is mounted under key map' } : {}) })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await w.clock.settle()
   w.frame(0); w.frame(1)
   await w.clock.settle()
-  expect(w.posts.map(p => new URL(p.url).pathname)).toContain('/pause')
+  expect(w.posts.map(path)).toContain('/pause')
   await ui.redraw()
-  expect(w.posts.map(p => new URL(p.url).pathname).at(-1)).toBe('/resume')
+  expect(w.posts.map(path).at(-1)).toBe('/resume')
 })
 
-test('board posts are coalesced to at most ten a second', async ($, on) => {
+test('board posts are coalesced to at most ten a second and the newest board arrives', SLOW, async ($, on) => {
   const w = world(on)
   await $.ui.mount({ ...PANE, surface: 'terminal' })
   await w.clock.settle()
-  for (let k = 0; k < 10; k++) await $.tool.call({ tool: 'Read', file_path: `/a/${k}.ts` })
+  for (let k = 0; k < 10; k++) await $.tool.call({ tool: 'Read', file_path: `/a/b${k}.ts` })
   await w.clock.advance(1000)
-  const boards = w.posts.filter(p => new URL(p.url).pathname === '/board')
+  const boards = w.posts.filter(p => path(p) === '/board')
   expect(boards.length).toBeLessThanOrEqual(1 + 10)
+  expect(JSON.stringify(boards.at(-1)!.body)).toContain('b9.ts')
 })
 
-test('a helper that exits three times within a minute leaves the text view, and an E line counts as a failure', async ($, on) => {
-  const w = world(on)
+test('a helper that exits three times within a minute leaves the text view, and an E line counts as a failure', SLOW, async ($, on) => {
   let starts = 0
-  on('process.spawn', async function* () { starts++; yield { stream: 'stdout', text: starts === 1 ? 'E no cc\n' : '' }; return { code: 2, signal: null } })
+  const w = world(on, { spawn: async function* () { starts++; yield { stream: 'stdout', text: starts === 1 ? 'E no cc\n' : 'S x\n' }; return { value: { code: 2, signal: null } } } })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await w.clock.advance(10_000)
   expect(starts).toBe(3)
   expect(await ui.find({ type: 'Image' })).toBeUndefined()
 })
 
-test('desktop still gets the Svg and no helper is started for it', async ($, on) => {
+test('a refused socket request gives the text view', SLOW, async ($, on) => {
+  const w = world(on, { fetchOk: false })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  w.frame(0) // wakes the fake helper so its loop can see it was ended
+  await w.clock.settle()
+  expect(w.stopped()).toBe(1)
+})
+
+test('with Claude Code on a light theme and the map on auto, setup says light; a theme change posts setup again', SLOW, async ($, on) => {
+  const w = world(on, { theme: { value: 'light-daltonized' } })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  const setups = () => w.posts.filter(p => path(p) === '/setup').map(p => (p.body as { light: boolean }).light)
+  expect(setups()).toEqual([true])
+  await $.config.set({ key: 'theme', value: 'dark' })
+  await w.clock.settle()
+  expect(setups()).toEqual([true, false])
+})
+
+test('/lot-map stats names the mode and the frames', SLOW, async ($, on) => {
+  const w = world(on)
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  const out = await $.command.run({ name: 'lot-map', args: 'stats' })
+  expect(out.text).toMatch(/^mode: picture/)
+  expect(out.text).toMatch(/frames: 1 taken · 0 refused/)
+})
+
+test('desktop still gets the Svg and no helper is started for it', SLOW, async ($, on) => {
   const w = world(on)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Svg' })).toBeDefined()
@@ -839,21 +974,16 @@ test('desktop still gets the Svg and no helper is started for it', async ($, on)
 })
 ```
 
-  Where the kit's shapes differ (`process.spawn`'s answer as an async generator, the `http.fetch` input's `init`, `mock.env`), adjust the shapes but keep each assertion. If two `world`s cannot be registered in one test, split the iTerm2 and tmux cases into separate tests. In the dying-helper test, the later `process.spawn` hook must win over `world`'s; register it so it does.
+  Where a kit shape differs, adjust the shape but keep each assertion. Shapes to watch: the `process.run` refusal, the `config.set` answer, and `$.command.run`'s result. Every hook is registered inside `world`, before the test's first `$` call, as the kit requires.
 - [ ] **Step 3: Run them to verify they fail.** Run `claude plugin test . 2>&1 | grep -E "\((pass|fail)\)"`. Expected: the new tests fail, and Task 10's pass.
 - [ ] **Step 4: Add the option and the tag.** Add `terminal` to `Setup`, `setupFrom` and `plugin.json`, and add the tag atom to `types/index.d.ts`.
 - [ ] **Step 5: Implement the wiring in `hooks/register.tsx`.**
-  - **Starting.** On the first render, read `ENV_NAMES` with `$.env.get`. If picture mode applies, make or read the tag and start the helper from a closure written in that hook: `$.process.spawn({ argv: [bun, \`${$.plugin.root}/helper/painter.ts\`, socket, tag] })`. If Step 1 found that a render-started child does not survive, start it from `session.start`'s closure instead.
-  - **Finding `bun`.** `$.process.run(['bun', '--version'])`; if that rejects, `${HOME}/.bun/bin/bun` when `$.fs.exists` says it is there; otherwise the text view.
-  - **Reading the helper.** Read its stdout through `LineReader`. On `R`, post `/setup` (`options`, `light`, `rows`), then the current board. An `E` line is logged to `/lot-map stats` and the loop ends, which counts as an exit for `HelperPolicy`.
-  - **Relaying.** Relay each `F` to `$.ui.blit({ requestId: 'lot-map', key: 'map', source: { shm, format: 'rgba', width, height } })` and feed the result to `PictureGate`:
-    - `pause` → POST `/pause`;
-    - `text` → end the spawn loop (which kills the helper) and `$.ui.invalidate('ui.render')`.
-  - **Restarts.** A loop that ends goes to `HelperPolicy`.
-  - **Board posts.** Post `/board` through `Coalescer` on board changes, with `now` and `changedAt`. Post `/resume` on a render after a pause, and `/setup` again on a theme change, a `rows` change or an option change.
-  - **Theme.** Read the theme row on the first render and in a `config.set` hook on `{ key: 'theme' }`.
-  - **The tree.** Draw it as the spec says: the Image `key="map"` sized to the ring box, with the placeholder (or Step 1's fallback) until the first frame, then the last frame's shm source; the "now" line; the feed. Every Text has `wrap="truncate-end"`.
-  - **Stats.** Add `/lot-map stats`.
+  - **Finding `bun`.** `$.process.run(['bun', '--version'])`; if that is refused or rejects, `${HOME}/.bun/bin/bun` when `$.fs.exists` says it is there; otherwise the text view.
+  - **Starting.** Start the helper from the render hook's closure: `$.process.spawn({ argv: [bun, \`${$.plugin.root}/helper/painter.ts\`, socket, tag] })`.
+  - **Reading the helper.** Read its stdout through `LineReader`. On `R`, post `/setup` and the current board. Relay each `F` to `$.ui.blit({ requestId: 'lot-map', key: 'map', source: { shm, format: 'rgba', width, height, generation } })` and feed the result to `PictureGate`. An `E` line is recorded for stats and ends the loop.
+  - **Restarts and reopening.** A loop that ends goes to `HelperPolicy`. When `PictureGate.rendered` returns `reopen`, start a fresh helper outside the policy.
+  - **The tree.** Draw it as the spec says: the Image `key="map"` sized to the ring box, with the 1×1 placeholder, or Step 1's fallback, until the first frame, then the last frame's shm source. The "now" line and the feed follow, every Text with `wrap="truncate-end"`.
+  - **Failures.** Every engine call is wrapped in `quietly`; a failure draws the text view.
 - [ ] **Step 6: Run everything and validate.** Run `claude plugin test . && bun test helper && claude plugin validate .`. Expected: all pass, the 42 original tests included, and `✔ Validation passed`.
 - [ ] **Step 7: Commit:** `git add hooks .claude-plugin/plugin.json types && git commit -m "Show the map as a moving picture in Ghostty and kitty, painted by the helper"`
 
@@ -864,27 +994,27 @@ test('desktop still gets the Svg and no helper is started for it', async ($, on)
 - Delete: the `ring-test` mod folder.
 
 - [ ] **Step 1: Update `README.md`.**
-  - **Install, line 25:** where the picture shows (Ghostty or kitty, local, fullscreen, docked; needs bun), and where text stays (iTerm2 and why, tmux, ssh, VS Code).
+  - **Install, line 25:** where the picture shows (Ghostty or kitty, local, fullscreen, docked; needs bun), and where text stays (iTerm2 and why, tmux, zellij, screen, ssh, VS Code).
   - **Options table:** add `terminal`.
   - **Colours:** in a terminal, `auto` follows Claude Code's theme.
   - **"What it shows and what it keeps":**
-    - the helper process, shared memory, the local socket, and that no frames touch the disk;
+    - the helper process, shared memory and the local socket, and that no frames touch the disk;
     - that the board passes through Claude Code's request machinery, where another plugin that watches requests could see its labels;
     - that it reads the `theme` setting.
   - **Font:** its licence and data size.
   - **Commands:** `/lot-map stats`.
-  - **Developing:** add `bun test helper`.
+  - **Developing:** add `bun test helper` and `bun scripts/bench.ts`.
 - [ ] **Step 2: Set the version.** Set `"version": "0.4.0"`, then run `claude plugin validate .`. Expected: `✔ Validation passed`.
 - [ ] **Step 3: The person's check.** They disable the installed lot-map in `/plugin` and start `claude --plugin-dir /Users/froch/Development/claude/lot-map` in Ghostty, fullscreen, with the pane docked, then work for five minutes. They check:
   - the map moves smoothly with no stutter at events, and typing is normal;
   - `/lot-map stats` shows frames taken with no ongoing refusals;
   - the controller samples CPU for the helper, Claude Code and Ghostty, and Ghostty's memory, against the spec's Done means;
-  - after quitting, `/lm-<tag>-k` names are gone (checked with the helper's `read`);
+  - after quitting, no `/lm-<tag>-k` name can be read (with `helper/feed.ts`'s read);
   - iTerm2 shows the text view with no helper process;
   - `terminal: text` gives text;
   - the desktop app shows the map as before.
 
   Record the numbers under the spec's Done means.
-- [ ] **Step 4: Final checks.** Run `bun scripts/golden.ts check && claude plugin test . && bun test helper && claude plugin validate .`. Expected: `0 mismatches`, all pass.
+- [ ] **Step 4: Final checks.** Run `bun scripts/golden.ts check && claude plugin test . && bun test helper && claude plugin validate . && bun scripts/bench.ts`. Expected: `0 mismatches`, all pass, budgets met.
 - [ ] **Step 5: Clean up.** Delete `/Users/froch/.claude/dev-mods/4e805010-94ea-4bde-a455-ed356869fa4a/ring-test`.
 - [ ] **Step 6: Commit:** `git add README.md .claude-plugin docs/superpowers/specs/2026-11-12-terminal-ring-design.md && git commit -m "Describe the terminal map, version 0.4.0"`
