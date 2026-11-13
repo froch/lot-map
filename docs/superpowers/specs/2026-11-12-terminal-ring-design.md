@@ -308,6 +308,27 @@ Decided (2026-11-12): outline, JetBrains Mono (SIL OFL 1.1), compared in the doc
 - **README:** updated (terminal note, the option, its requirements, what it reads).
 - **Version 0.4.0.** The throwaway `ring-test` mod is deleted.
 
+### Measured on 2026-11-13 (Ghostty, Claude Code 2.1.323, branch at 7de0840)
+
+- **The person's verdict:** "looking good". Smooth, with no flicker after R18 and a stable layout after R19.
+- **`/lot-map stats` after a working turn:**
+  - 2,131 frames taken, 0 refused, 0 dropped, 0 restarts;
+  - blit 0.5 ms on average;
+  - the helper at 15 fps, painting in 10.4 ms and writing shared memory in 0.37 ms.
+- **CPU during the working turn:**
+  - helper 14–23% of a core, mostly about 20%, **above the 15% target** (`fill()` allocations are the known hotspot);
+  - Claude Code 4–11%, which includes Claude's own work;
+  - Ghostty 5–8%, with memory flat at about 160 MB.
+- **Not yet measured:**
+  - idle CPU after the route fades;
+  - shared-memory clean-up after quitting;
+  - the iTerm2 text-view check, which is covered by tests only.
+- **Checks:**
+  - `claude plugin test .`: 129 pass;
+  - `bun test helper`: 37 pass;
+  - `bun scripts/golden.ts check`: 0 mismatches;
+  - `claude plugin validate .`: passes.
+
 ## Left to the builder
 
 - The module split, and how scene elements are typed.
