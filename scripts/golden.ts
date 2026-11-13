@@ -3,7 +3,8 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { GOLDEN_CASES, fingerprint } from '../hooks/golden-cases'
 import { GOLDEN } from '../hooks/golden-hashes'
-import { drawMap, setupFrom } from '../hooks/map'
+import { setupFrom } from '../hooks/map'
+import { drawMap } from '../hooks/svg'
 
 const render = (g: (typeof GOLDEN_CASES)[number]): string => drawMap(g.board, g.now, setupFrom(g.options))
 const root = join(import.meta.dir, '..')

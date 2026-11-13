@@ -2,8 +2,9 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Board, Entry, StationId, Status } from '../types'
-import { STATIONS, classify, clean, describeNow, drawMap, firstLine, foldRows, formatMs, memoryIds, setupFrom, shortModel } from './map'
+import { STATIONS, classify, clean, describeNow, firstLine, foldRows, formatMs, memoryIds, setupFrom, shortModel } from './map'
 import type { Setup } from './map'
+import { drawMap } from './svg'
 
 const PANE = 'lot-map'
 const KEEP = 80
