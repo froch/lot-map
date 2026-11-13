@@ -11,6 +11,21 @@ export function parseColor(hex: string): Rgb {
   return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)]
 }
 
+const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1
+
+/** One pixel at byte `i`, premultiplied in `d`, straight in `out`. */
+function unpremultiply(d: Uint8Array, out: Uint8Array, i: number): void {
+  const a = d[i + 3]!
+  if (a === 255) {
+    out[i] = d[i]!; out[i + 1] = d[i + 1]!; out[i + 2] = d[i + 2]!; out[i + 3] = 255
+  } else if (a === 0) {
+    out[i] = 0; out[i + 1] = 0; out[i + 2] = 0; out[i + 3] = 0
+  } else {
+    const k = 255 / a
+    out[i] = Math.min(255, Math.round(d[i]! * k)); out[i + 1] = Math.min(255, Math.round(d[i + 1]! * k)); out[i + 2] = Math.min(255, Math.round(d[i + 2]! * k)); out[i + 3] = a
+  }
+}
+
 export class Canvas {
   readonly width: number
   readonly height: number
@@ -44,23 +59,34 @@ export class Canvas {
   }
 
   private straight: Uint8Array | null = null
+  private straight32: Uint32Array | null = null
+  private data32: Uint32Array | null = null
+
+  /**
+   * The picture as straight RGBA bytes, in a buffer this canvas reuses: valid until the next call.
+   * Opaque and clear pixels go across a word at a time; on a little-endian machine alpha is a word's top byte.
+   */
+  toStraight(): Uint8Array {
+    const d = this.data
+    const out = (this.straight ??= new Uint8Array(d.length))
+    if (!LITTLE_ENDIAN) {
+      for (let i = 0; i < d.length; i += 4) unpremultiply(d, out, i)
+      return out
+    }
+    const src = (this.data32 ??= new Uint32Array(d.buffer, d.byteOffset, d.length >> 2))
+    const dst = (this.straight32 ??= new Uint32Array(out.buffer, out.byteOffset, out.length >> 2))
+    for (let p = 0; p < src.length; p++) {
+      const w = src[p]!
+      const a = w >>> 24
+      if (a === 255 || a === 0) dst[p] = a === 0 ? 0 : w
+      else unpremultiply(d, out, p << 2)
+    }
+    return out
+  }
 
   /** The picture as straight RGBA, base64. */
   toBase64(): string {
-    const d = this.data
-    const out = (this.straight ??= new Uint8Array(d.length))
-    for (let i = 0; i < d.length; i += 4) {
-      const a = d[i + 3]!
-      if (a === 255) {
-        out[i] = d[i]!; out[i + 1] = d[i + 1]!; out[i + 2] = d[i + 2]!; out[i + 3] = 255
-      } else if (a === 0) {
-        out[i] = 0; out[i + 1] = 0; out[i + 2] = 0; out[i + 3] = 0
-      } else {
-        const k = 255 / a
-        out[i] = Math.min(255, Math.round(d[i]! * k)); out[i + 1] = Math.min(255, Math.round(d[i + 1]! * k)); out[i + 2] = Math.min(255, Math.round(d[i + 2]! * k)); out[i + 3] = a
-      }
-    }
-    return (out as unknown as { toBase64(): string }).toBase64()
+    return (this.toStraight() as unknown as { toBase64(): string }).toBase64()
   }
 
   /** Source-over of one colour at `sa` (0–1) on one pixel. */

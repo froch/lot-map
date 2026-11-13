@@ -8,6 +8,10 @@ import { drawText, textWidth } from './paint/text'
 import { stringsFor } from './text'
 import { isChanging, parseClock, sample, windowOf } from './paint/timeline'
 import type { SceneNode } from './scene'
+import { LayerCache, paintScene, pictureFor } from './paint/scene-paint'
+import { sceneOf } from './scene'
+import { GOLDEN_CASES } from './golden-cases'
+import type { Board, Entry } from '../types'
 
 const near = (a: number, b: number, eps = 1e-6) => expect(Math.abs(a - b)).toBeLessThan(eps)
 const WHITE = parseColor('#ffffff')
@@ -242,4 +246,108 @@ test('motion along a line and rotation about a point', () => {
   expect(sample(move, 0, 400).offset).toEqual({ x: 5, y: 0 })
   const spin: SceneNode = { tag: 'g', attrs: [], children: [{ tag: 'animateTransform', attrs: [['attributeName', 'transform'], ['type', 'rotate'], ['from', '0 50 50'], ['to', '360 50 50'], ['begin', '-1.750s'], ['dur', '7.000s'], ['repeatCount', 'indefinite']], motion: 'slow' }] }
   expect(sample(spin, 0, 0).rotate).toEqual({ degrees: 90, cx: 50, cy: 50 })
+})
+
+const SLOW = { timeoutMs: 30000 }
+const P12 = pictureFor(12)
+const P20 = pictureFor(20)
+const at = (name: string) => GOLDEN_CASES.find(g => g.name === name)!
+const scene = (name: string, now?: number) => { const g = at(name); return sceneOf(g.board, now ?? g.now, setupFrom(g.options)) }
+const DARK_OPTS = { light: false, colors: {} }
+const inCore = (p = P20) => [Math.round(230 * p.scale), Math.round(182 * p.scale)] as const
+const ground = (p = P20) => [Math.round(4 * p.scale), Math.round(215 * p.scale)] as const
+const held = (lastAt: number): Board => ({
+  counts: { files: 1, shell: 1, web: 1 },
+  entries: (['files', 'shell', 'web'] as const).map((station, k): Entry => ({ id: `h${k}`, station, label: 'x', from: 'core', startedAt: lastAt - (2 - k) * 1000, endedAt: lastAt - (2 - k) * 1000 + 500, status: 'ok' })),
+})
+
+test('toStraight gives straight bytes and toBase64 encodes them', () => {
+  const c = new Canvas(2, 1)
+  fill(c, roundRect(0, 0, 1, 1, 0), parseColor('#ff0000'), 1)
+  const bytes = c.toStraight()
+  expect([...bytes]).toEqual([255, 0, 0, 255, 0, 0, 0, 0])
+  expect(c.toBase64()).toBe(bytes.toBase64())
+})
+
+test('the picture follows the pane: 408 to 1000 px tall, 34 px a row', () => {
+  expect(pictureFor(20)).toEqual({ width: 727, height: 680, scale: 680 / 430 })
+  expect(pictureFor(12).height).toBe(408)
+  expect(pictureFor(40)).toEqual({ width: 1070, height: 1000, scale: 1000 / 430 })
+})
+
+test('a cached frame equals an uncached one', SLOW, () => {
+  for (const p of [P12, P20]) {
+    const s = scene('busy-default')
+    const cache = new LayerCache(p, DARK_OPTS)
+    for (const dt of [0, 130]) expect(paintScene(s, s.now + dt, p, DARK_OPTS, cache).toBase64() === paintScene(s, s.now + dt, p, DARK_OPTS).toBase64()).toBe(true)
+  }
+})
+
+test('after a count changes, only that station and its spoke are repainted', SLOW, () => {
+  const g = at('busy-default')
+  const cache = new LayerCache(P12, DARK_OPTS)
+  paintScene(sceneOf(g.board, g.now, setupFrom(g.options)), g.now, P12, DARK_OPTS, cache)
+  const counted = { ...g.board, counts: { ...g.board.counts, skills: (g.board.counts.skills ?? 0) + 1 } }
+  paintScene(sceneOf(counted, g.now, setupFrom(g.options)), g.now, P12, DARK_OPTS, cache)
+  const fresh = cache.repainted.filter(k => !k.startsWith('route') && !k.startsWith('motion'))
+  expect(fresh.some(k => k.startsWith('station:skills'))).toBe(true)
+  expect(fresh.every(k => k.startsWith('station:skills') || k.startsWith('spoke:skills'))).toBe(true)
+  expect(cache.repainted.some(k => k.startsWith('ground'))).toBe(false)
+})
+
+test('a route in its hold is painted once, then neither frames nor a rebuilt scene repaint it', SLOW, () => {
+  const now = 2_000_000
+  const cache = new LayerCache(P12, DARK_OPTS)
+  paintScene(sceneOf(held(now - 10_000), now, setupFrom({})), now, P12, DARK_OPTS, cache)
+  expect(cache.repainted.some(k => k.startsWith('route'))).toBe(true)
+  paintScene(sceneOf(held(now - 10_000), now, setupFrom({})), now + 2000, P12, DARK_OPTS, cache)
+  expect(cache.repainted.filter(k => k.startsWith('route'))).toEqual([])
+  paintScene(sceneOf(held(now - 10_000), now + 1000, setupFrom({})), now + 3000, P12, DARK_OPTS, cache)
+  expect(cache.repainted.filter(k => k.startsWith('route'))).toEqual([])
+})
+
+test('the cache keeps only the layers the last frame used', SLOW, () => {
+  const cache = new LayerCache(P12, DARK_OPTS)
+  const a = scene('busy-default')
+  paintScene(a, a.now, P12, DARK_OPTS, cache)
+  const used = cache.size
+  for (let k = 0; k < 5; k++) {
+    const g = at('busy-default')
+    const b = sceneOf({ ...g.board, counts: { ...g.board.counts, files: (g.board.counts.files ?? 0) + k + 1 } }, g.now, setupFrom(g.options))
+    paintScene(b, b.now, P12, DARK_OPTS, cache)
+  }
+  expect(cache.size).toBeLessThanOrEqual(used)
+})
+
+test('the core is the node colour, the corners are clear, and transparent leaves the ground empty', SLOW, () => {
+  const s = scene('busy-default')
+  const solid = paintScene(s, s.now, P20, DARK_OPTS)
+  expect(solid.pixel(...inCore())).toEqual([18, 21, 28, 255])
+  expect(solid.pixel(0, 0)[3]).toBe(0)
+  expect(solid.pixel(...ground())).toEqual([10, 12, 17, 255])
+  const clear = scene('setup-background-transparent')
+  expect(paintScene(clear, clear.now, P20, DARK_OPTS).pixel(...ground())[3]).toBe(0)
+})
+
+test('on a light terminal the painter remaps as desktop does, keeping colours of ones own', SLOW, () => {
+  const s = scene('busy-default')
+  expect(paintScene(s, s.now, P12, { light: true, colors: {} }).pixel(...inCore(P12))).toEqual([255, 255, 255, 255])
+  const g = at('busy-default')
+  const own = setupFrom({ colors: ['node=#123456'] })
+  const mine = sceneOf(g.board, g.now, own)
+  expect(paintScene(mine, mine.now, P12, { light: true, colors: own.colors }).pixel(...inCore(P12))).toEqual([18, 52, 86, 255])
+})
+
+test('with nothing running the core does not breathe, and the cache repaints nothing between frames', SLOW, () => {
+  const s = scene('board-idle-faded')
+  const cache = new LayerCache(P12, DARK_OPTS)
+  const a = paintScene(s, s.now, P12, DARK_OPTS, cache).toBase64()
+  expect(paintScene(s, s.now + 2400, P12, DARK_OPTS, cache).toBase64() === a).toBe(true)
+  expect(cache.repainted).toEqual([])
+})
+
+test('a fresh board, a board with no model and a core name outside the font all paint', SLOW, () => {
+  for (const name of ['board-empty', 'board-no-model', 'setup-core-<&">']) expect(() => paintScene(scene(name), scene(name).now, P12, DARK_OPTS)).not.toThrow()
+  const odd = sceneOf({ entries: [], counts: {} }, 0, setupFrom({ coreName: '日本🙂' }))
+  expect(() => paintScene(odd, 0, P12, DARK_OPTS)).not.toThrow()
 })
