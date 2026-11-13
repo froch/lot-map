@@ -79,3 +79,241 @@ test('helper lines are read across pieces and malformed ones are dropped', () =>
     { kind: 'E', message: 'no cc' },
   ])
 })
+
+// ---- Task 12: the pane wired to the helper --------------------------------------------------------
+
+const SLOW = { timeoutMs: 30000 }
+const DOCK = { title: 'Map', isFocused: false, bodyColumns: 89, placement: 'dock', scroll: { offset: 0, bodyRows: 34 }, view: {} } as const
+const PANE = { plugin: 'lot-map', component: 'Pane', requestId: 'lot-map', props: DOCK } as const
+const GHOSTTY = { TERM_PROGRAM: 'ghostty', TMPDIR: '/var/folders/ab/cdefgh/T/', HOME: '/Users/x' }
+const path = (p: { url: string }) => new URL(p.url).pathname
+
+type Spawn = (feed: (line: string) => void) => AsyncGenerator<{ stream: 'stdout'; text: string }, { value: { code: number | null; signal: string | null } }>
+
+/** A world with a fake helper that prints R, then F lines when told to. */
+const world = (on: On, opts: { env?: Record<string, string>; blit?: (n: number) => { deny?: string }; bun?: boolean; fetchOk?: boolean; spawn?: Spawn; theme?: { value: string } } = {}) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.env(on, opts.env ?? GHOSTTY)
+  const spawned: string[][] = []
+  const posts: { url: string; body: unknown }[] = []
+  const blits: { name: string; generation: number; at: number }[] = []
+  let stopped = 0
+  let feed: (line: string) => void = () => {}
+  const standard: Spawn = async function* (push) {
+    const lines: string[] = ['R\n']
+    let wake: (() => void) | undefined
+    feed = line => { lines.push(line); wake?.() }
+    try {
+      while (true) {
+        while (lines.length > 0) yield { stream: 'stdout', text: lines.shift()! }
+        await new Promise<void>(r => { wake = r })
+      }
+    } finally { stopped++ }
+  }
+  on('process.run', () => (opts.bun === false ? { deny: 'not found' } : { value: { exitCode: 0, stdout: '1.4.4\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('fs.exists', () => ({ value: opts.bun !== false }))
+  on('process.spawn', async function* (_, e) { spawned.push([...e.argv]); return yield* (opts.spawn ?? standard)(line => feed(line)) })
+  on('http.fetch', (_, e) => {
+    posts.push({ url: e.url, body: JSON.parse(String(e.init?.body ?? 'null')) })
+    return opts.fetchOk === false ? { deny: 'refused by policy' } : { value: { status: 200, ok: true, headers: {}, text: '{}' } }
+  })
+  on('ui.blit', (_, e) => { const s = ('source' in e ? e.source : {}) as { shm: string; generation: number }; blits.push({ name: s.shm, generation: s.generation, at: clock.now() }); return { value: opts.blit?.(blits.length) ?? {} } })
+  on('config.list', () => ({ value: opts.theme === undefined ? [] : [{ key: 'theme', label: 'Theme', kind: 'choice', value: opts.theme.value, provider: { plugin: 'engine', tier: 'core' }, isLocked: false }] }))
+  on('config.set', (_, e) => { if (opts.theme !== undefined) opts.theme.value = String(e.value); return { value: e.value } })
+  on('tool.call', () => ({ result: {} }))
+  return { clock, spawned, posts, blits, stopped: () => stopped, frame: (k: number) => feed(`F /lm-abcd1234-${k % 8} 727 680 ${k + 1}\n`) }
+}
+
+test('in Ghostty the pane starts one helper, posts setup and board, and relays frames with their generation', SLOW, async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(w.spawned.length).toBe(1)
+  const tag = w.spawned[0]!.at(-1)!
+  expect(w.spawned[0]!.at(-2)).toBe(`/var/folders/ab/cdefgh/T/lot-map-${tag}/h.sock`)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  expect(((await ui.find({ type: 'Image' }))!.props.source as { width: number }).width).toBe(1)
+  w.frame(0); w.frame(1)
+  await w.clock.settle()
+  expect(w.blits.map(b => [b.name, b.generation])).toEqual([['/lm-abcd1234-0', 1], ['/lm-abcd1234-1', 2]])
+  await ui.redraw()
+  const image = await ui.find({ type: 'Image' })
+  expect(image?.props).toMatchObject({ key: 'map', columns: 45, rows: 20, source: { shm: '/lm-abcd1234-1', width: 727, height: 680 } })
+})
+
+test('iTerm2 starts no helper and shows no picture', SLOW, async ($, on) => {
+  const w = world(on, { env: { TERM_PROGRAM: 'iTerm.app' } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.spawned.length).toBe(0)
+})
+
+test('tmux starts no helper and shows no picture', SLOW, async ($, on) => {
+  const w = world(on, { env: { ...GHOSTTY, TMUX: '/tmp/t' } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.spawned.length).toBe(0)
+})
+
+test('an inline pane, a short pane and a machine without bun show the text view', SLOW, async ($, on) => {
+  const w = world(on, { bun: false })
+  for (const props of [{ ...DOCK, placement: 'inline' }, { ...DOCK, scroll: { offset: 0, bodyRows: 19 } }, DOCK]) {
+    const ui = await $.ui.mount({ ...PANE, props, surface: 'terminal' } as never)
+    expect(await ui.find({ type: 'Image' })).toBeUndefined()
+    await ui.unmount()
+  }
+  expect(w.spawned.length).toBe(0)
+})
+
+test('with terminal set to text the pane draws todays text view', { ...SLOW, options: { terminal: 'text' } }, async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.spawned.length).toBe(0)
+})
+
+test('the feed is cut to fit under the picture, every row one line long', SLOW, async ($, on) => {
+  world(on)
+  for (let k = 0; k < 20; k++) {
+    if (k % 2 === 0) await $.tool.call({ tool: 'Read', file_path: `/a/${k}/${'p'.repeat(120)}.ts` })
+    else await $.tool.call({ tool: 'Bash', command: 'true', description: `${k} ${'x'.repeat(200)}` })
+  }
+  for (const [bodyRows, rows] of [[34, 20], [20, 12], [60, 36]] as const) {
+    const ui = await $.ui.mount({ ...PANE, props: { ...DOCK, scroll: { offset: 0, bodyRows } }, surface: 'terminal' })
+    const texts = await ui.findAll({ type: 'Text' })
+    for (const t of texts) expect(t.props.wrap).toBe('truncate-end')
+    expect(texts.length).toBe(Math.min(bodyRows - rows, 1 + 16))
+    await ui.unmount()
+  }
+})
+
+test('two alt refusals two seconds apart stop the helper and show text by themselves', SLOW, async ($, on) => {
+  const w = world(on, { blit: () => ({ deny: 'the Image draws its alt here: no images' }) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.advance(2100)
+  w.frame(1)
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  w.frame(2) // wakes the fake helper so its loop can see it was ended
+  await w.clock.settle()
+  expect(w.stopped()).toBe(1)
+})
+
+test('a not-mounted refusal pauses the helper, and the next render resumes it', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n === 2 ? { deny: 'no Image of its own is mounted under key map' } : {}) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0); w.frame(1)
+  await w.clock.settle()
+  expect(w.posts.map(path)).toContain('/pause')
+  await ui.redraw()
+  expect(w.posts.map(path).at(-1)).toBe('/resume')
+})
+
+test('board posts are coalesced to at most ten a second and the newest board arrives', SLOW, async ($, on) => {
+  const w = world(on)
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  for (let k = 0; k < 10; k++) await $.tool.call({ tool: 'Read', file_path: `/a/b${k}.ts` })
+  await w.clock.advance(1000)
+  const boards = w.posts.filter(p => path(p) === '/board')
+  expect(boards.length).toBeLessThanOrEqual(1 + 10)
+  expect(JSON.stringify(boards.at(-1)!.body)).toContain('b9.ts')
+})
+
+test('a helper that exits three times within a minute leaves the text view, and an E line counts as a failure', SLOW, async ($, on) => {
+  let starts = 0
+  const w = world(on, { spawn: async function* () { starts++; yield { stream: 'stdout', text: starts === 1 ? 'E no cc\n' : 'S x\n' }; return { value: { code: 2, signal: null } } } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.advance(10_000)
+  expect(starts).toBe(3)
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+})
+
+test('a refused socket request gives the text view', SLOW, async ($, on) => {
+  const w = world(on, { fetchOk: false })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  w.frame(0) // wakes the fake helper so its loop can see it was ended
+  await w.clock.settle()
+  expect(w.stopped()).toBe(1)
+})
+
+test('with Claude Code on a light theme and the map on auto, setup says light; a theme change posts setup again', SLOW, async ($, on) => {
+  const w = world(on, { theme: { value: 'light-daltonized' } })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  const setups = () => w.posts.filter(p => path(p) === '/setup').map(p => (p.body as { light: boolean }).light)
+  expect(setups()).toEqual([true])
+  await $.config.set({ key: 'theme', value: 'dark', previous: 'light-daltonized', provider: { plugin: 'engine', tier: 'core' }, origin: { kind: 'composer' } })
+  await w.clock.settle()
+  expect(setups()).toEqual([true, false])
+})
+
+test('/lot-map stats names the mode and the frames', SLOW, async ($, on) => {
+  const w = world(on)
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  const out = await $.command.run({ command: 'lot-map', args: 'stats', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
+  expect(out.text).toMatch(/^mode: picture/)
+  expect(out.text).toMatch(/frames: 1 taken · 0 refused/)
+})
+
+test('desktop still gets the Svg and no helper is started for it', SLOW, async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Svg' })).toBeDefined()
+  expect(w.spawned.length).toBe(0)
+})
+
+test('a pane shown again while the map is still asks the helper for a fresh frame, and only then', SLOW, async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  await ui.unmount()
+  await w.clock.advance(100)
+  let again = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  await again.unmount()
+  await w.clock.advance(300)
+  again = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  w.frame(1)
+  await w.clock.settle()
+  await again.redraw()
+  expect((await again.find({ type: 'Image' }))?.props.source).toEqual({ shm: '/lm-abcd1234-1', format: 'rgba', width: 727, height: 680, generation: 2 })
+  expect(w.spawned.length).toBe(1)
+})
+
+test('the session keeps the helper tag in $.state, and the helper is started with it', SLOW, async ($, on) => {
+  const w = world(on)
+  const written: unknown[] = []
+  on('state.set', (_, e, next) => {
+    if (e.key === 'tag') written.push(e.value)
+    return next(e)
+  })
+  on('command.register', () => ({ value: { command: 'lot-map' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect(written.length).toBe(1)
+  expect(written[0]).toMatch(/^[a-z0-9]{8}$/)
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(w.spawned[0]!.at(-1)).toBe(written[0] as string)
+})
+
+test('a tag kept from before a reload names the next helper', SLOW, async ($, on) => {
+  const w = world(on)
+  on('state.get', (_, e, next) => (e.key === 'tag' ? { value: { value: 'kept0tag', version: 1 } } : next(e)))
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(w.spawned[0]!.slice(-2)).toEqual(['/var/folders/ab/cdefgh/T/lot-map-kept0tag/h.sock', 'kept0tag'])
+})

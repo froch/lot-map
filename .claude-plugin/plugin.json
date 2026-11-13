@@ -110,6 +110,16 @@
       ],
       "default": "you-top",
       "description": "Where you are on the map: at the top, or at the bottom with the network and the browser at the top."
+    },
+    "terminal": {
+      "type": "string",
+      "title": "In the terminal",
+      "options": [
+        "picture",
+        "text"
+      ],
+      "default": "picture",
+      "description": "How the map shows in a terminal: as a moving picture in Ghostty or kitty (needs bun; uses shared memory and a local socket), or as text."
     }
   }
 }

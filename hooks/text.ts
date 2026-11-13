@@ -2,6 +2,64 @@
 // A new language is one more table here and one more value of `language` in plugin.json.
 import type { StationId } from '../types'
 
+/** Why the terminal pane shows text and not the picture. */
+export type TextReason = 'undrawn' | 'option' | 'inline' | 'small' | 'terminal' | 'bun' | 'images' | 'socket' | 'helper' | 'failed'
+
+/** Where the helper that paints the terminal picture stands. */
+export type HelperState = 'idle' | 'starting' | 'running' | 'paused' | 'restarting' | 'stopped' | 'given-up'
+
+/** What `/lot-map stats` reports about the terminal picture. */
+export type PictureStats = {
+  /** Why the pane last drew text; absent while it draws the picture. */
+  text?: { reason: TextReason; cause?: string }
+  taken: number
+  refused: number
+  /** The words of each refusal, with how many times it came. */
+  refusals: readonly (readonly [string, number])[]
+  helper: HelperState
+  restarts: number
+  /** Milliseconds a blit took to answer; absent before the first. */
+  blitMs?: { average: number; p95: number }
+  lastS?: string
+  lastE?: string
+  posts: { sent: number; coalesced: number }
+}
+
+/** The words of `/lot-map stats` in one language; `statsIn` lays them out the same way in all of them. */
+type StatsWords = {
+  mode: (shown: string) => string
+  picture: string
+  text: (why: string) => string
+  reasons: Record<TextReason, string>
+  frames: (taken: number, refused: number) => string
+  helper: (state: string, restarts: number) => string
+  states: Record<HelperState, string>
+  blit: (average: string, p95: string) => string
+  noBlits: string
+  lastS: (line: string) => string
+  lastE: (line: string) => string
+  none: string
+  posts: (sent: number, coalesced: number) => string
+  decimal: (n: number) => string
+}
+
+const statsIn =
+  (w: StatsWords) =>
+  (s: PictureStats): string =>
+    [
+      w.mode(s.text === undefined ? w.picture : w.text(`${w.reasons[s.text.reason]}${s.text.cause ? `: ${s.text.cause}` : ''}`)),
+      w.frames(s.taken, s.refused),
+      ...s.refusals.map(([words, n]) => `  ${n} × ${words}`),
+      w.helper(w.states[s.helper], s.restarts),
+      s.blitMs === undefined ? w.noBlits : w.blit(w.decimal(s.blitMs.average), w.decimal(s.blitMs.p95)),
+      w.lastS(s.lastS ?? w.none),
+      ...(s.lastE === undefined ? [] : [w.lastE(s.lastE)]),
+      w.posts(s.posts.sent, s.posts.coalesced),
+    ].join('\n')
+
+const point = (n: number): string => n.toFixed(1)
+const comma = (n: number): string => n.toFixed(1).replace('.', ',')
+
 export type Strings = {
   title: string
   command: string
@@ -38,6 +96,10 @@ export type Strings = {
   ms: (n: number) => string
   seconds: (s: string) => string
   minutes: (m: number, s: number) => string
+  /** What `/lot-map stats` answers. */
+  stats: (s: PictureStats) => string
+  /** The toast when a request to the helper's socket is refused or fails. */
+  socketRefused: (cause: string) => string
 }
 
 const en: Strings = {
@@ -87,6 +149,34 @@ const en: Strings = {
   ms: n => `${n} ms`,
   seconds: s => `${s} s`,
   minutes: (m, s) => `${m} min ${s} s`,
+  stats: statsIn({
+    mode: shown => `mode: ${shown}`,
+    picture: 'picture',
+    text: why => `text (${why})`,
+    reasons: {
+      undrawn: 'the pane has not drawn in the terminal yet',
+      option: 'the terminal option is set to text',
+      inline: 'the pane is not docked',
+      small: 'the pane is too small for the ring',
+      terminal: 'this terminal is not Ghostty or kitty, or runs inside tmux, zellij, screen or ssh',
+      bun: 'bun was not found',
+      images: 'the terminal draws no images here',
+      socket: "the helper's socket refused a request",
+      helper: 'the helper exited three times within a minute',
+      failed: 'drawing the picture failed',
+    },
+    frames: (taken, refused) => `frames: ${taken} taken · ${refused} refused`,
+    helper: (state, restarts) => `helper: ${state} · ${restarts} restart${restarts === 1 ? '' : 's'}`,
+    states: { idle: 'not started', starting: 'starting', running: 'running', paused: 'paused', restarting: 'restarting', stopped: 'stopped', 'given-up': 'given up' },
+    blit: (average, p95) => `blit: ${average} ms on average · ${p95} ms p95`,
+    noBlits: 'blit: none yet',
+    lastS: line => `helper's last S line: ${line}`,
+    lastE: line => `helper's last E line: ${line}`,
+    none: 'none',
+    posts: (sent, coalesced) => `board posts: ${sent} sent · ${coalesced} coalesced`,
+    decimal: point,
+  }),
+  socketRefused: cause => `The map could not reach its picture helper (${cause}), so it shows as text.`,
 }
 
 const ru: Strings = {
@@ -136,6 +226,34 @@ const ru: Strings = {
   ms: n => `${n} мс`,
   seconds: s => `${s} с`,
   minutes: (m, s) => `${m} мин ${s} с`,
+  stats: statsIn({
+    mode: shown => `режим: ${shown}`,
+    picture: 'картинка',
+    text: why => `текст (${why})`,
+    reasons: {
+      undrawn: 'панель ещё не рисовалась в терминале',
+      option: 'в настройке terminal выбран текст',
+      inline: 'панель не закреплена сбоку',
+      small: 'панель мала для кольца',
+      terminal: 'это не Ghostty и не kitty, или терминал работает внутри tmux, zellij, screen или ssh',
+      bun: 'bun не найден',
+      images: 'терминал не рисует здесь картинок',
+      socket: 'сокет помощника отказал в запросе',
+      helper: 'помощник завершился три раза за минуту',
+      failed: 'картинку не удалось нарисовать',
+    },
+    frames: (taken, refused) => `кадры: принято ${taken} · отклонено ${refused}`,
+    helper: (state, restarts) => `помощник: ${state} · перезапусков ${restarts}`,
+    states: { idle: 'не запущен', starting: 'запускается', running: 'работает', paused: 'на паузе', restarting: 'перезапускается', stopped: 'остановлен', 'given-up': 'больше не запускается' },
+    blit: (average, p95) => `вывод кадра: в среднем ${average} мс · p95 ${p95} мс`,
+    noBlits: 'вывод кадра: пока ни одного',
+    lastS: line => `последняя строка S помощника: ${line}`,
+    lastE: line => `последняя строка E помощника: ${line}`,
+    none: 'нет',
+    posts: (sent, coalesced) => `состояние карты: отправлено ${sent} · объединено ${coalesced}`,
+    decimal: point,
+  }),
+  socketRefused: cause => `Карта не достучалась до помощника, который рисует картинку (${cause}), и показывается текстом.`,
 }
 
 const es: Strings = {
@@ -185,6 +303,34 @@ const es: Strings = {
   ms: n => `${n} ms`,
   seconds: s => `${s} s`,
   minutes: (m, s) => `${m} min ${s} s`,
+  stats: statsIn({
+    mode: shown => `modo: ${shown}`,
+    picture: 'imagen',
+    text: why => `texto (${why})`,
+    reasons: {
+      undrawn: 'el panel aún no se ha dibujado en el terminal',
+      option: 'la opción terminal está en texto',
+      inline: 'el panel no está acoplado',
+      small: 'el panel es demasiado pequeño para el anillo',
+      terminal: 'este terminal no es Ghostty ni kitty, o funciona dentro de tmux, zellij, screen o ssh',
+      bun: 'no se encontró bun',
+      images: 'el terminal no dibuja imágenes aquí',
+      socket: 'el socket del ayudante rechazó una petición',
+      helper: 'el ayudante terminó tres veces en un minuto',
+      failed: 'no se pudo dibujar la imagen',
+    },
+    frames: (taken, refused) => `fotogramas: ${taken} aceptados · ${refused} rechazados`,
+    helper: (state, restarts) => `ayudante: ${state} · ${restarts} reinicio${restarts === 1 ? '' : 's'}`,
+    states: { idle: 'sin iniciar', starting: 'iniciándose', running: 'en marcha', paused: 'en pausa', restarting: 'reiniciándose', stopped: 'detenido', 'given-up': 'abandonado' },
+    blit: (average, p95) => `envío de fotograma: ${average} ms de media · p95 ${p95} ms`,
+    noBlits: 'envío de fotograma: ninguno aún',
+    lastS: line => `última línea S del ayudante: ${line}`,
+    lastE: line => `última línea E del ayudante: ${line}`,
+    none: 'ninguna',
+    posts: (sent, coalesced) => `estados del mapa: ${sent} enviados · ${coalesced} fusionados`,
+    decimal: point,
+  }),
+  socketRefused: cause => `El mapa no pudo comunicarse con su ayudante de imagen (${cause}); se muestra como texto.`,
 }
 
 const fr: Strings = {
@@ -234,6 +380,34 @@ const fr: Strings = {
   ms: n => `${n} ms`,
   seconds: s => `${s.replace('.', ',')} s`,
   minutes: (m, s) => `${m} min ${s} s`,
+  stats: statsIn({
+    mode: shown => `mode : ${shown}`,
+    picture: 'image',
+    text: why => `texte (${why})`,
+    reasons: {
+      undrawn: "le panneau ne s'est pas encore affiché dans le terminal",
+      option: "l'option terminal est réglée sur texte",
+      inline: "le panneau n'est pas ancré",
+      small: "le panneau est trop petit pour l'anneau",
+      terminal: "ce terminal n'est ni Ghostty ni kitty, ou il tourne dans tmux, zellij, screen ou ssh",
+      bun: 'bun est introuvable',
+      images: "le terminal n'affiche pas d'images ici",
+      socket: "le socket de l'auxiliaire a refusé une requête",
+      helper: "l'auxiliaire s'est arrêté trois fois en une minute",
+      failed: "l'image n'a pas pu être dessinée",
+    },
+    frames: (taken, refused) => `images : ${taken} acceptée${taken > 1 ? 's' : ''} · ${refused} refusée${refused > 1 ? 's' : ''}`,
+    helper: (state, restarts) => `auxiliaire : ${state} · ${restarts} redémarrage${restarts > 1 ? 's' : ''}`,
+    states: { idle: 'pas démarré', starting: 'en démarrage', running: 'en marche', paused: 'en pause', restarting: 'en redémarrage', stopped: 'arrêté', 'given-up': 'abandonné' },
+    blit: (average, p95) => `envoi d'image : ${average} ms en moyenne · p95 ${p95} ms`,
+    noBlits: "envoi d'image : aucun pour le moment",
+    lastS: line => `dernière ligne S de l'auxiliaire : ${line}`,
+    lastE: line => `dernière ligne E de l'auxiliaire : ${line}`,
+    none: 'aucune',
+    posts: (sent, coalesced) => `états de la carte : ${sent} envoyé${sent > 1 ? 's' : ''} · ${coalesced} fusionné${coalesced > 1 ? 's' : ''}`,
+    decimal: comma,
+  }),
+  socketRefused: cause => `La carte n'a pas pu joindre son auxiliaire d'image (${cause}) ; elle s'affiche en texte.`,
 }
 
 const de: Strings = {
@@ -283,6 +457,34 @@ const de: Strings = {
   ms: n => `${n} ms`,
   seconds: s => `${s.replace('.', ',')} s`,
   minutes: (m, s) => `${m} Min. ${s} s`,
+  stats: statsIn({
+    mode: shown => `Modus: ${shown}`,
+    picture: 'Bild',
+    text: why => `Text (${why})`,
+    reasons: {
+      undrawn: 'das Panel wurde im Terminal noch nicht gezeichnet',
+      option: 'die Option terminal steht auf Text',
+      inline: 'das Panel ist nicht angedockt',
+      small: 'das Panel ist zu klein für den Ring',
+      terminal: 'dieses Terminal ist weder Ghostty noch kitty oder läuft in tmux, zellij, screen oder ssh',
+      bun: 'bun wurde nicht gefunden',
+      images: 'das Terminal zeigt hier keine Bilder',
+      socket: 'der Socket des Helfers hat eine Anfrage abgelehnt',
+      helper: 'der Helfer wurde dreimal in einer Minute beendet',
+      failed: 'das Bild ließ sich nicht zeichnen',
+    },
+    frames: (taken, refused) => `Bilder: ${taken} angenommen · ${refused} abgelehnt`,
+    helper: (state, restarts) => `Helfer: ${state} · ${restarts} Neustart${restarts === 1 ? '' : 's'}`,
+    states: { idle: 'nicht gestartet', starting: 'startet', running: 'läuft', paused: 'pausiert', restarting: 'startet neu', stopped: 'gestoppt', 'given-up': 'aufgegeben' },
+    blit: (average, p95) => `Bildübergabe: ${average} ms im Mittel · p95 ${p95} ms`,
+    noBlits: 'Bildübergabe: noch keine',
+    lastS: line => `letzte S-Zeile des Helfers: ${line}`,
+    lastE: line => `letzte E-Zeile des Helfers: ${line}`,
+    none: 'keine',
+    posts: (sent, coalesced) => `Kartenstände: ${sent} gesendet · ${coalesced} zusammengefasst`,
+    decimal: comma,
+  }),
+  socketRefused: cause => `Die Karte hat ihren Bildhelfer nicht erreicht (${cause}) und wird als Text gezeigt.`,
 }
 
 const TABLES = new Map<unknown, Strings>([['en', en], ['ru', ru], ['es', es], ['fr', fr], ['de', de]])
