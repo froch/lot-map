@@ -188,3 +188,17 @@ test('a rim is drawn around the letters in its own colour', () => {
   while (x < c.width && c.pixel(x, 22)[3] < 255) x++
   expect(c.pixel(x, 22)).toEqual([10, 12, 17, 255])
 })
+
+test("the stroke candidate keeps the outline candidate's advance and cap height in the em", () => {
+  near(STROKE.regular.advance / STROKE.regular.unitsPerEm, OUTLINE.regular.advance / OUTLINE.regular.unitsPerEm, 1e-6)
+  near(STROKE.regular.capHeight / STROKE.regular.unitsPerEm, OUTLINE.regular.capHeight / OUTLINE.regular.unitsPerEm, 1e-6)
+})
+
+test('one stroke call paints a pixel once, even where its lines cross', () => {
+  const c = new Canvas(40, 40)
+  stroke(c, [...line(5, 20.5, 35, 20.5), ...line(20.5, 5, 20.5, 35)], 4, WHITE, 0.5, 'butt')
+  const away = c.pixel(10, 20)[3]
+  expect(away).toBeGreaterThan(100)
+  // whole numbers, so this is "within 1"
+  near(c.pixel(20, 20)[3], away, 1.5)
+})

@@ -1,5 +1,6 @@
 // Writes the stroke font candidate: Hershey Roman Simplex for printable ASCII, and the rest of what the font
-// checkpoint's still draws (Cyrillic, ä ö ü ß and a few signs) drawn here by hand in the same measures.
+// checkpoint's still draws (Cyrillic, ä ö ü ß and a few signs) drawn here by hand in the same measures, all set
+// in the outline candidate's em so that both candidates are compared at the same sizes and widths.
 //   bun scripts/font/build-stroke.ts <rowmans.jhf> > hooks/paint/font-stroke.ts
 // Development only. The .jhf file is read as data. Same input, same bytes out.
 import { readFileSync } from 'node:fs'
@@ -8,19 +9,24 @@ import { STILL_TEXT } from '../../hooks/paint/font'
 /** Polylines in font units, y up from the baseline, as flat lists x0 y0 x1 y1 … */
 type Strokes = number[][]
 
-// Roman Simplex's grid is the font's unit: capitals stand 21 high, small letters 14, descenders reach 7 below,
-// and its brackets span the em, from 25 above the baseline to 7 below: 32 units.
-const UNITS_PER_EM = 32
-const ASCENT = 25
-const CAP_HEIGHT = 21
-// About the stem of the outline candidate (0.09 em): lighter reads faint at 13 px, heavier fills the e at 13 px.
-const STROKE_WIDTH = 2.8
+// The outline candidate's measures (JetBrains Mono): its em, cap height and advance.
+const UNITS_PER_EM = 1000
+const CAP_HEIGHT = 730
+const ADVANCE = 600
+// Roman Simplex's grid: capitals stand 21 high, small letters 14, descenders reach 7 below, and its brackets
+// span its em, from 25 above the baseline to 7 below. Its glyphs are scaled whole to the outline's cap height.
+const SCALE = CAP_HEIGHT / 21
+const ASCENT = Math.round(25 * SCALE)
+// About the outline candidate's stem (90): lighter reads faint at 13 px, heavier fills the e at 13 px.
+const STROKE_WIDTH = 90
 const BOLD = 1.6
+// A glyph wider, with the regular pen, than the advance less this at each side is narrowed about its middle.
+const MARGIN = 60
 
 /** Reads a .jhf file: one glyph a record, printable ASCII from the space on, in Hershey's y-down grid. */
-function readJhf(text: string): Map<string, { strokes: Strokes; width: number }> {
+function readJhf(text: string): Map<string, Strokes> {
   const lines = text.split(/\r?\n/)
-  const glyphs = new Map<string, { strokes: Strokes; width: number }>()
+  const glyphs = new Map<string, Strokes>()
   let i = 0
   for (let code = 0x20; code <= 0x7e; code++) {
     let record = lines[i++] ?? ''
@@ -28,8 +34,7 @@ function readJhf(text: string): Map<string, { strokes: Strokes; width: number }>
     if (!Number.isInteger(pairs) || pairs < 1) throw new Error(`bad record for ${JSON.stringify(String.fromCharCode(code))}`)
     // a long record may run on over the next lines
     while (record.length < 8 + 2 * pairs && i < lines.length) record += lines[i++]
-    // the first pair is the glyph's left and right sides
-    const width = record.charCodeAt(9) - record.charCodeAt(8)
+    // the first pair is the glyph's left and right sides, which a monospaced font has no use for
     const body = record.slice(10, 8 + 2 * pairs)
     const strokes: Strokes = [[]]
     for (let j = 0; j + 1 < body.length; j += 2) {
@@ -37,7 +42,7 @@ function readJhf(text: string): Map<string, { strokes: Strokes; width: number }>
       // x and y count from R; the baseline is at 9 and y grows downward
       strokes[strokes.length - 1]!.push(body.charCodeAt(j) - 82, 9 - (body.charCodeAt(j + 1) - 82))
     }
-    glyphs.set(String.fromCharCode(code), { strokes: strokes.filter(s => s.length >= 4), width })
+    glyphs.set(String.fromCharCode(code), strokes.filter(s => s.length >= 4))
   }
   return glyphs
 }
@@ -82,14 +87,15 @@ const MARKED: Readonly<Record<string, { base: string; mark: Strokes }>> = {
   'й': { base: 'и', mark: BREVE },
 }
 
+const xsOf = (strokes: Strokes) => strokes.flatMap(s => s.filter((_, i) => i % 2 === 0))
 const middle = (strokes: Strokes) => {
-  const xs = strokes.flatMap(s => s.filter((_, i) => i % 2 === 0))
+  const xs = xsOf(strokes)
   return xs.length === 0 ? 0 : (Math.min(...xs) + Math.max(...xs)) / 2
 }
 const shifted = (strokes: Strokes, dx: number) => strokes.map(s => s.map((v, i) => (i % 2 === 0 ? v + dx : v)))
 
-function strokesOf(hershey: Map<string, { strokes: Strokes }>, ch: string): Strokes {
-  const own = hershey.get(ch)?.strokes ?? DRAWN[ch]
+function strokesOf(hershey: Map<string, Strokes>, ch: string): Strokes {
+  const own = hershey.get(ch) ?? DRAWN[ch]
   if (own) return own
   if (SAME[ch]) return strokesOf(hershey, SAME[ch])
   const marked = MARKED[ch]
@@ -100,26 +106,37 @@ function strokesOf(hershey: Map<string, { strokes: Strokes }>, ch: string): Stro
   throw new Error(`no strokes for ${JSON.stringify(ch)}`)
 }
 
-const num = (v: number) => String(Math.round(v * 100) / 100)
+/**
+ * The glyph in font units, whole numbers: scaled to the cap height, its ink centred in the advance, and narrowed
+ * about its middle if it would not fit there with the regular pen and a margin at each side.
+ */
+function placed(strokes: Strokes): Strokes {
+  const xs = xsOf(strokes)
+  if (xs.length === 0) return []
+  const mid = middle(strokes)
+  const wide = (Math.max(...xs) - Math.min(...xs)) * SCALE
+  const room = ADVANCE - 2 * MARGIN - STROKE_WIDTH
+  const narrow = wide > room ? room / wide : 1
+  return strokes.map(s => s.map((v, i) => Math.round(i % 2 === 0 ? ADVANCE / 2 + (v - mid) * SCALE * narrow : v * SCALE)))
+}
 
-/** SVG path data: each polyline an m and relative lines, the glyph's ink centred in the advance. */
-function pathOf(strokes: Strokes, advance: number): string {
-  const dx = advance / 2 - middle(strokes)
+/** SVG path data: each polyline an m and relative lines. */
+function pathOf(strokes: Strokes): string {
   let out = ''
   let cx = 0
   let cy = 0
-  for (const s of shifted(strokes, dx)) {
+  for (const s of placed(strokes)) {
     const parts: string[] = []
     for (let i = 0; i < s.length; i += 2) {
       const x = s[i]!
       const y = s[i + 1]!
       const ddx = x - cx
       const ddy = y - cy
-      if (i === 0) parts.push(`m${num(ddx)} ${num(ddy)}`)
+      if (i === 0) parts.push(`m${ddx} ${ddy}`)
       else if (ddx === 0 && ddy === 0) continue
-      else if (ddy === 0) parts.push(`h${num(ddx)}`)
-      else if (ddx === 0) parts.push(`v${num(ddy)}`)
-      else parts.push(`l${num(ddx)} ${num(ddy)}`)
+      else if (ddy === 0) parts.push(`h${ddx}`)
+      else if (ddx === 0) parts.push(`v${ddy}`)
+      else parts.push(`l${ddx} ${ddy}`)
       cx = x
       cy = y
     }
@@ -128,19 +145,17 @@ function pathOf(strokes: Strokes, advance: number): string {
   return out
 }
 
-function face(hershey: Map<string, { strokes: Strokes; width: number }>, name: string, strokeWidth: number, chars: string[]): string {
-  // every glyph is centred in the width of the widest Latin capital (M and W, 24 with their sides)
-  const advance = Math.max(...[...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'].map(ch => hershey.get(ch)!.width))
+function face(hershey: Map<string, Strokes>, name: string, strokeWidth: number, chars: string[]): string {
   return [
     `  ${name}: {`,
     `    kind: 'stroke',`,
     `    unitsPerEm: ${UNITS_PER_EM},`,
     `    ascent: ${ASCENT},`,
     `    capHeight: ${CAP_HEIGHT},`,
-    `    advance: ${advance},`,
-    `    strokeWidth: ${num(strokeWidth)},`,
+    `    advance: ${ADVANCE},`,
+    `    strokeWidth: ${Math.round(strokeWidth)},`,
     `    glyphs: {`,
-    ...chars.map(ch => `      ${JSON.stringify(ch)}: ${JSON.stringify(pathOf(strokesOf(hershey, ch), advance))},`),
+    ...chars.map(ch => `      ${JSON.stringify(ch)}: ${JSON.stringify(pathOf(strokesOf(hershey, ch)))},`),
     `    },`,
     `  },`,
   ].join('\n')
@@ -154,7 +169,7 @@ if (import.meta.main) {
   const chars = [...new Set([...ascii, ...STILL_TEXT, ...'äöüß'])].sort((a, b) => a.codePointAt(0)! - b.codePointAt(0)!)
   const out = [
     '// Hershey Roman Simplex. The Hershey Fonts were originally created by Dr. A. V. Hershey while working at the U. S. National Bureau of Standards. The format of the Font data in this distribution was originally created by James Hurt, Cognition, Inc., 900 Technology Park Drive, Billerica, MA 01821 (mit-eddie!ci-dandelion!hurt).',
-    '// Generated by scripts/font/build-stroke.ts from rowmans.jhf, with the Cyrillic, ä ö ü ß and signs drawn in that script. Do not edit.',
+    '// Generated by scripts/font/build-stroke.ts from rowmans.jhf, with the Cyrillic, ä ö ü ß and signs drawn in that script, in the outline candidate\'s em. Do not edit.',
     "import type { Font } from './font'",
     '',
     'export const STROKE: Font = {',

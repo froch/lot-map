@@ -378,29 +378,43 @@ export function fill(c: Canvas, shape: Polyline[], color: Rgb, alpha: number): v
 
 // ---- stroke ----------------------------------------------------------------------------------
 
-/** Distance-to-segment coverage over each polyline's bounding box; joins round, ends butt or round. */
+// One call's coverage, reused across calls: grown when a call needs more, and zeroed again as it is spent.
+let coverage = new Float32Array(0)
+let touched = new Int32Array(0)
+
+/**
+ * Distance-to-segment coverage; joins round, ends butt or round. A pixel takes the most any segment of any
+ * polyline in the call gives it and is blended once, so lines that cross or meet never paint it twice.
+ */
 export function stroke(c: Canvas, lines: Polyline[], width: number, color: Rgb, alpha: number, cap: 'butt' | 'round'): void {
   if (alpha <= 0 || width <= 0) return
   const hw = width / 2
   const reach = hw + 1
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
   for (const l of lines) {
-    const pts = l.points
-    if (pts.length === 0) continue
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-    for (const p of pts) {
+    for (const p of l.points) {
       if (p.x < minX) minX = p.x
       if (p.x > maxX) maxX = p.x
       if (p.y < minY) minY = p.y
       if (p.y > maxY) maxY = p.y
     }
-    const x0 = Math.max(0, Math.floor(minX - reach))
-    const y0 = Math.max(0, Math.floor(minY - reach))
-    const x1 = Math.min(c.width - 1, Math.ceil(maxX + reach))
-    const y1 = Math.min(c.height - 1, Math.ceil(maxY + reach))
-    if (x1 < x0 || y1 < y0) continue
-    const bw = x1 - x0 + 1
-    const bh = y1 - y0 + 1
-    const cov = new Float32Array(bw * bh)
+  }
+  const x0 = Math.max(0, Math.floor(minX - reach))
+  const y0 = Math.max(0, Math.floor(minY - reach))
+  const x1 = Math.min(c.width - 1, Math.ceil(maxX + reach))
+  const y1 = Math.min(c.height - 1, Math.ceil(maxY + reach))
+  if (!(x1 >= x0 && y1 >= y0)) return
+  const bw = x1 - x0 + 1
+  const size = bw * (y1 - y0 + 1)
+  if (coverage.length < size) {
+    coverage = new Float32Array(size)
+    touched = new Int32Array(size)
+  }
+  const cov = coverage
+  let count = 0
+  for (const l of lines) {
+    const pts = l.points
+    if (pts.length === 0) continue
     const segs: { a: Point; b: Point; roundA: boolean; roundB: boolean }[] = []
     const n = l.closed ? pts.length : pts.length - 1
     if (pts.length === 1 || (n >= 1 && pts.every(p => p.x === pts[0]!.x && p.y === pts[0]!.y))) {
@@ -442,15 +456,19 @@ export function stroke(c: Canvas, lines: Polyline[], width: number, color: Rgb, 
           if (v <= 0) continue
           if (v > 1) v = 1
           const i = (y - y0) * bw + (x - x0)
-          if (v > cov[i]!) cov[i] = v
+          const was = cov[i]!
+          if (v > was) {
+            if (was === 0) touched[count++] = i
+            cov[i] = v
+          }
         }
       }
     }
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
-        const v = cov[(y - y0) * bw + (x - x0)]!
-        if (v > 0) c.blend((y * c.width + x) * 4, color, v * alpha)
-      }
-    }
+  }
+  for (let j = 0; j < count; j++) {
+    const i = touched[j]!
+    const v = cov[i]!
+    cov[i] = 0
+    c.blend(((y0 + Math.floor(i / bw)) * c.width + x0 + (i % bw)) * 4, color, v * alpha)
   }
 }
