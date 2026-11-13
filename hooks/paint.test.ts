@@ -351,3 +351,41 @@ test('a fresh board, a board with no model and a core name outside the font all 
   const odd = sceneOf({ entries: [], counts: {} }, 0, setupFrom({ coreName: '日本🙂' }))
   expect(() => paintScene(odd, 0, P12, DARK_OPTS)).not.toThrow()
 })
+
+import { IDLE_CAP_MS, changedAt, motionAt } from './paint/motion'
+
+const NOW = 1_000_000
+let seq = 0
+const entry = (e: Partial<Entry> & Pick<Entry, 'station' | 'startedAt' | 'status'>): Entry => ({ id: `m${seq++}`, label: 'x', from: 'core', ...e })
+const boardWith = (...entries: Entry[]): Board => ({ entries, counts: {} })
+/** Stops 1000 ms apart, the last at `lastAt`; each finished 500 ms after it started. */
+const boardWithRoute = (stations: Entry['station'][], lastAt: number): Board =>
+  boardWith(...stations.map((station, k) => entry({ station, startedAt: lastAt - (stations.length - 1 - k) * 1000, endedAt: lastAt - (stations.length - 1 - k) * 1000 + 500, status: 'ok' })))
+
+test('a call that just started flies at 20, a long call loops at 15, and a still map is 0', () => {
+  const fresh = boardWith(entry({ station: 'shell', startedAt: NOW - 100, status: 'run' }))
+  expect(motionAt(sceneOf(fresh, NOW, setupFrom({})), NOW, changedAt(fresh)).fps).toBe(20)
+  const long = boardWith(entry({ station: 'shell', startedAt: NOW - 30_000, status: 'run' }))
+  expect(motionAt(sceneOf(long, NOW, setupFrom({})), NOW, changedAt(long)).fps).toBe(15)
+  const done = boardWith(entry({ station: 'shell', startedAt: NOW - 200_000, endedAt: NOW - 199_000, status: 'ok' }))
+  expect(motionAt(sceneOf(done, NOW, setupFrom({})), NOW, changedAt(done))).toEqual({ fps: 0 })
+})
+
+test('each leg of the route holds for 40 seconds from its own stop and then fades at 15', () => {
+  const route = boardWithRoute(['files', 'shell', 'web'], NOW - 10_000)
+  const s = sceneOf(route, NOW, setupFrom({}))
+  expect(motionAt(s, NOW, changedAt(route))).toEqual({ fps: 0, wakeAt: NOW - 11_000 + 40_000 })
+  expect(motionAt(s, NOW + 35_000, changedAt(route)).fps).toBe(15)
+})
+
+test('a subagent that never reported back slows to 1 fps after five minutes without a change', () => {
+  const stuck: Board = { ...boardWith(entry({ station: 'agents', startedAt: NOW - 400_000, status: 'run', from: 'agents', agentId: 'a1' })), agents: ['a1'] }
+  const s = sceneOf(stuck, NOW, setupFrom({}))
+  expect(motionAt(s, NOW, NOW - 100_000).fps).toBe(15)
+  expect(motionAt(s, NOW, NOW - IDLE_CAP_MS).fps).toBe(1)
+})
+
+test('a fresh session is still', () => {
+  const empty: Board = { entries: [], counts: {} }
+  expect(motionAt(sceneOf(empty, NOW, setupFrom({})), NOW, changedAt(empty))).toEqual({ fps: 0 })
+})
