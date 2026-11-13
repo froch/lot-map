@@ -6,6 +6,8 @@ import { COVERAGE, STILL_TEXT, missing } from './paint/font'
 import { FONT } from './paint/font-data'
 import { drawText, textWidth } from './paint/text'
 import { stringsFor } from './text'
+import { isChanging, parseClock, sample, windowOf } from './paint/timeline'
+import type { SceneNode } from './scene'
 
 const near = (a: number, b: number, eps = 1e-6) => expect(Math.abs(a - b)).toBeLessThan(eps)
 const WHITE = parseColor('#ffffff')
@@ -194,4 +196,50 @@ test('one stroke call paints a pixel once, even where its lines cross', () => {
   expect(away).toBeGreaterThan(100)
   // whole numbers, so this is "within 1"
   near(c.pixel(20, 20)[3], away, 1.5)
+})
+
+const anim = (attrs: Record<string, string>): SceneNode => ({ tag: 'animate', attrs: Object.entries(attrs), motion: 'slow' })
+const el = (...children: SceneNode[]): SceneNode => ({ tag: 'circle', attrs: [['opacity', '0']], children })
+
+test('clock strings read as milliseconds', () => {
+  expect([parseClock('0.800s'), parseClock('-1.234s'), parseClock('.5s'), parseClock('1.4s')]).toEqual([800, -1234, 500, 1400])
+})
+
+test('an opacity fade interpolates, freezes at its end, and does not apply before it begins', () => {
+  const n = el(anim({ attributeName: 'opacity', values: '.75;0', begin: '-0.100s', dur: '1.600s', fill: 'freeze' }))
+  near(sample(n, 1000, 1000).values.get('opacity')!, 0.703125)
+  expect(sample(n, 1000, 3000).values.get('opacity')).toBe(0)
+  const late = el(anim({ attributeName: 'opacity', values: '.7;0', begin: '0.500s', dur: '0.450s' }))
+  expect(sample(late, 1000, 1200).values.has('opacity')).toBe(false)
+  expect(sample(late, 1000, 2000).values.has('opacity')).toBe(false)
+})
+
+test('keyTimes hold a pulse at full strength and then fade it', () => {
+  const n = el(anim({ attributeName: 'opacity', values: '1;1;0', keyTimes: '0;.82;1', begin: '0.000s', dur: '0.800s', fill: 'freeze' }))
+  expect(sample(n, 0, 400).values.get('opacity')).toBe(1)
+  near(sample(n, 0, 728).values.get('opacity')!, 0.5, 1e-3)
+})
+
+test('a counted repeat runs its laps and then freezes at its last value', () => {
+  const n = el(anim({ attributeName: 'r', values: '40;66', begin: '0.000s', dur: '1.6s', repeatCount: '3', fill: 'freeze' }))
+  near(sample(n, 0, 4000).values.get('r')!, 53)
+  expect(sample(n, 0, 6000).values.get('r')).toBe(66)
+  expect(windowOf(n.children![0] as SceneNode, 0)).toEqual({ from: 0, to: 4800 })
+  expect([isChanging(n, 0, -1), isChanging(n, 0, 100), isChanging(n, 0, 4800), isChanging(n, 0, 6000)]).toEqual([false, true, false, false])
+})
+
+test('of two opacity animations, the one that began later wins once it has begun', () => {
+  const n = el(
+    anim({ attributeName: 'opacity', values: '0;.85', begin: '0.400s', dur: '.15s', fill: 'freeze' }),
+    anim({ attributeName: 'opacity', values: '.85;0', begin: '40.000s', dur: '20.000s', fill: 'freeze' }),
+  )
+  expect(sample(n, 0, 1000).values.get('opacity')).toBe(0.85)
+  near(sample(n, 0, 50_000).values.get('opacity')!, 0.425)
+})
+
+test('motion along a line and rotation about a point', () => {
+  const move: SceneNode = { tag: 'circle', attrs: [], children: [{ tag: 'animateMotion', attrs: [['path', 'M0 0L10 0'], ['begin', '0.000s'], ['dur', '0.800s'], ['fill', 'freeze']], motion: 'fast' }] }
+  expect(sample(move, 0, 400).offset).toEqual({ x: 5, y: 0 })
+  const spin: SceneNode = { tag: 'g', attrs: [], children: [{ tag: 'animateTransform', attrs: [['attributeName', 'transform'], ['type', 'rotate'], ['from', '0 50 50'], ['to', '360 50 50'], ['begin', '-1.750s'], ['dur', '7.000s'], ['repeatCount', 'indefinite']], motion: 'slow' }] }
+  expect(sample(spin, 0, 0).rotate).toEqual({ degrees: 90, cx: 50, cy: 50 })
 })
