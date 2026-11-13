@@ -22,16 +22,16 @@ claude plugin install lot-map --marketplace alexeyw/lot-map
 
 In the desktop app: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `alexeyw/lot-map`, then **Add plugin**.
 
-The pane opens by itself when a session starts. In a terminal it needs at least 144 columns; otherwise type `/lot-map`.
+The pane opens by itself when a session starts. In a terminal, Claude Code opens a pane unasked only from 144 columns (110 once you have opened this one yourself and not closed it by hand since), so in a narrower terminal type `/lot-map`.
 
-In Ghostty or kitty, run locally, in Claude Code's fullscreen layout with the pane docked (110 columns or more), and with `bun` installed, the ring is a moving picture. Everywhere else it is text:
+In Ghostty or kitty, run locally, in Claude Code's fullscreen layout with the pane docked, and with `bun` installed, the ring is a moving picture. Claude Code docks a pane beside the fullscreen transcript from 110 columns; below that, or outside fullscreen, the pane sits inline above the prompt. Everywhere else the ring is text:
 
 - iTerm2 keeps every inline picture it receives, so its memory would grow without end;
 - in tmux, zellij, GNU screen and over ssh, shared memory can't reach the terminal;
 - VS Code's terminal, Terminal.app and any other terminal are not on the list;
 - a pane too short for a ring of 12 rows, and the inline pane, show text too.
 
-The `terminal` option turns the picture off. Built and tested on Claude Code 2.1.321 on macOS; users report it working on Windows as well.
+The `terminal` option turns the picture off. Built and tested on Claude Code 2.1.323 on macOS; users report it working on Windows as well.
 
 ## What lights up
 
@@ -137,15 +137,18 @@ echo '{"theme":"dark","colors":"accent=#7fb4ff,active=#b8d6ff,text=#e6edf7"}' | 
 
 ## What it shows and what it keeps
 
-In text mode, and in the desktop app, the mod makes no network requests, reads no files, runs no processes, calls no model and adds nothing to the conversation. Its rows live only for the session.
+With the `terminal` option set to `text`, and in the desktop app, the mod makes no network requests, reads no files, runs no processes, calls no model and adds nothing to the conversation. Its rows live only for the session.
 
-Picture mode does more:
+With `terminal` on `picture`, the default, a docked terminal pane with room for the ring reads a few environment variables to decide whether the terminal can show pictures: `TERM_PROGRAM`, `TERM`, `KITTY_WINDOW_ID`, `TMUX`, `ZELLIJ`, `STY`, `SSH_CONNECTION`, `SSH_TTY`, `TMPDIR` and `HOME`. It reads them in any terminal, iTerm2 included, also where it then shows text.
 
-- it starts a `bun` helper that paints the frames;
-- it runs `bun --version` to check that `bun` is there, and `pkill` to stop its own helper;
+In Ghostty or kitty, outside tmux, zellij, screen and ssh, picture mode does more:
+
+- it looks for `bun`: it runs `bun --version`, and if that fails, checks whether `~/.bun/bin/bun` exists;
+- it starts a `bun` helper that paints the frames, and runs `pkill` to stop its own helper, found by its socket path;
+- the helper compiles a small C shim for shared memory when it starts, with the C compiler built into bun (`bun:ffi` `cc`, which is TinyCC). On macOS that compiler needs the system headers that come with Xcode's Command Line Tools (`xcode-select --install`), which bun finds with `xcrun`; the Xcode app itself is not needed. Without them the helper cannot start, and the map shows as text;
 - frames go through POSIX shared memory and never touch the disk;
 - it opens a local Unix socket in a private directory, for the helper alone;
-- it reads Claude Code's `theme` setting and a few environment variables (`TERM_PROGRAM`, `TERM`, `KITTY_WINDOW_ID`, `TMUX`, `ZELLIJ`, `STY`, `SSH_CONNECTION`, `SSH_TTY`, `TMPDIR`, `HOME`) to decide whether the terminal can show pictures;
+- it reads Claude Code's `theme` setting;
 - the board, with its names and labels and never contents, passes through Claude Code's request machinery to the helper, so another plugin that watches requests could see it.
 
 Like any mod that follows tool calls, it is handed every call's whole input, including command lines and the text written to files. It takes names from that and nothing else; the code that does so is `classify` in `hooks/map.ts`. A marketplace added from this repository follows its `main` branch, so an update brings whatever is there: read the diff before updating if that matters to you.
@@ -168,7 +171,7 @@ A fault on the map never reaches a tool call or a model turn.
 
 ## The picture's cost
 
-The helper paints at up to 20 frames a second while something moves, 15 for the never-ending loops, and nothing when the map is still. In testing it took about a fifth of a CPU core at 20 frames a second, and Claude Code itself about 3%. `/lot-map stats` shows what the picture has done so far: frames taken, and any refusals.
+The helper paints at up to 20 frames a second while something moves, 15 for the never-ending loops, and nothing when the map is still. In testing it took about a fifth of a CPU core at 20 frames a second, and Claude Code itself about 3%. `/lot-map stats` shows what the picture has done so far: frames taken, refused, let go and asked for again, and the helper's state.
 
 ## Font
 
