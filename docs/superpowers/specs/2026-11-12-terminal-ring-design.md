@@ -236,6 +236,12 @@ On each redraw Claude Code compares the render's source with the previous render
   - `R = floor(bodyRows × 0.6)`;
   - `C = round(R × 2.1 × 460/430)`;
   - if `C > bodyColumns`, then `C = bodyColumns` and `R = floor(C / (2.1 × 460/430))`.
+- **The layout follows the window, not the room left (ruling R19, the person's request).** Claude Code reports `bodyRows` as the room free for the pane, and that shrinks and grows as its bottom area (spinner, status lines, prompts) changes while Claude works. Sizing from it made the picture resize and the feed jump during execution. The person asked that the image resize only when the window resizes, and that the text area stay fixed relative to the image.
+  - The ring box C×R and the feed length come from the window alone: `viewport.columns`, `viewport.rows`, `bodyColumns` (which changes only with the window or the dock) and the largest `bodyRows` seen since that key last changed. A change of key resets the maximum to the current `bodyRows`; a missing viewport keys on `bodyColumns` alone.
+  - Feed rows = `min(16, maxBodyRows − R − 1)`, under the now line.
+  - When `bodyRows` shrinks below the maximum in an unchanged window, nothing about the picture changes: no new Image size, no `/setup`. The feed keeps its row count and the pane clips its bottom rows; the picture stays at the top.
+  - A first reading taken while shrunk grows once when a larger `bodyRows` arrives.
+  - Implemented as `StableLayout` in `hooks/terminal.ts`; the text view is unchanged.
 - **Text view** when `R < 12`, when the placement is `inline`, or when any condition under Goals applies.
 
 ### Theme, background, colours (my calls)

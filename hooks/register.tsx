@@ -7,7 +7,7 @@ import type { Setup } from './map'
 import { boardBody, setupBody } from './helper-bodies'
 import { DARK, LIGHT, lightPairs } from './palette'
 import { drawMap } from './svg'
-import { Coalescer, HelperPolicy, LineReader, PictureGate, helperPattern, isNotMounted, isTag, newTag, ringBox, socketPath, terminalAllows } from './terminal'
+import { Coalescer, HelperPolicy, LineReader, PictureGate, helperPattern, isNotMounted, isTag, StableLayout, newTag, socketPath, terminalAllows } from './terminal'
 import type { Env } from './terminal'
 import type { HelperState, PictureStats, TextReason } from './text'
 
@@ -317,6 +317,8 @@ export const register: Register = (on, options) => {
   const column = Math.max(8, ...Object.values(t.stations).map(name => name.length))
 
   const pic = freshPicture()
+  /** The picture's size follows the window, not the room left while Claude works (ruling R19). */
+  const layout = new StableLayout()
   /** In auto, the map follows Claude Code's theme row; a dark or light setting is already in its palette. */
   const isLight = (): boolean => setup.theme === 'auto' && (pic.themeRow ?? '').startsWith('light')
   const setupNow = (): string => setupBody(options, isLight(), pic.rows)
@@ -524,7 +526,8 @@ export const register: Register = (on, options) => {
     const current = <Text mono size="footnote">{describeNow(state, t)}</Text>
 
     if (e.surface === 'terminal') {
-      const box = e.props.placement === 'dock' ? ringBox(e.props.scroll.bodyRows, e.props.bodyColumns) : undefined
+      const fit = e.props.placement === 'dock' ? layout.update(e.viewport?.columns, e.viewport?.rows, e.props.bodyColumns, e.props.scroll.bodyRows) : undefined
+      const box = fit?.box
       let why: Shown | undefined =
         setup.terminal === 'text'
           ? { reason: 'option' }
@@ -925,7 +928,7 @@ export const register: Register = (on, options) => {
                   {t.nothingYet}
                 </Text>,
               ]),
-        ].slice(0, Math.max(0, e.props.scroll.bodyRows - box.rows))
+        ].slice(0, 1 + (fit?.feedRows ?? 0))
         return (
           <Box flexDirection="column">
             <Box justifyContent="center">

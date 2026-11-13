@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { Coalescer, HelperPolicy, LineReader, PictureGate, helperPattern, isTag, newTag, ringBox, socketPath, terminalAllows } from './terminal'
+import { Coalescer, HelperPolicy, LineReader, PictureGate, helperPattern, StableLayout, isTag, newTag, ringBox, socketPath, terminalAllows } from './terminal'
 
 const ALT = 'the Image draws its alt here: this terminal draws no images'
 const NOT_MOUNTED = 'no Image of its own is mounted under key map'
@@ -39,6 +39,29 @@ test('pkill finds a helper by its socket tail, the dot matched literally, and on
   expect(found.test('bun /p/helper/painter.ts /tmp/lot-map-abcd1235/h.sock abcd1235')).toBe(false)
   expect(isTag(newTag(Math.random))).toBe(true)
   for (const bad of ['', 'abcd123', 'abcd12345', 'ABCD1234', '.*.*.*.*', 'abcd/234', 42, undefined]) expect(isTag(bad)).toBe(false)
+})
+
+test('StableLayout keeps the box and the feed while bodyRows shrinks and grows in one window', () => {
+  const layout = new StableLayout()
+  const first = layout.update(120, 50, 89, 34)
+  expect(first).toEqual({ box: { columns: 45, rows: 20 }, feedRows: 13 })
+  expect(layout.update(120, 50, 89, 28)).toEqual(first)
+  expect(layout.update(120, 50, 89, 34)).toEqual(first)
+})
+
+test('StableLayout recomputes when the window or the pane width changes', () => {
+  const layout = new StableLayout()
+  layout.update(120, 50, 89, 34)
+  expect(layout.update(120, 40, 89, 20)).toEqual({ box: { columns: 27, rows: 12 }, feedRows: 7 })
+  expect(layout.update(120, 40, 60, 20).box?.columns).toBe(27)
+  expect(new StableLayout().update(undefined, undefined, 89, 60).box).toEqual({ columns: 81, rows: 36 })
+})
+
+test('StableLayout grows once when a larger bodyRows arrives after a first reading taken while shrunk', () => {
+  const layout = new StableLayout()
+  expect(layout.update(120, 50, 89, 28).box).toEqual({ columns: 36, rows: 16 })
+  expect(layout.update(120, 50, 89, 34).box).toEqual({ columns: 45, rows: 20 })
+  expect(layout.update(120, 50, 89, 28).box).toEqual({ columns: 45, rows: 20 })
 })
 
 test('two alt refusals two seconds apart switch to text; a render a minute later reopens', () => {
@@ -259,12 +282,43 @@ test('the feed is cut to fit under the picture, every row one line long', SLOW, 
     else await $.tool.call({ tool: 'Bash', command: 'true', description: `${k} ${'x'.repeat(200)}` })
   }
   for (const [bodyRows, rows] of [[34, 20], [20, 12], [60, 36]] as const) {
-    const ui = await $.ui.mount({ ...PANE, props: { ...DOCK, scroll: { offset: 0, bodyRows } }, surface: 'terminal' })
+    // Each mount is its own window, so its layout starts afresh.
+    const ui = await $.ui.mount({ ...PANE, props: { ...DOCK, scroll: { offset: 0, bodyRows } }, surface: 'terminal', viewport: { columns: 200, rows: bodyRows + 10 } })
     const texts = await ui.findAll({ type: 'Text' })
     for (const t of texts) expect(t.props.wrap).toBe('truncate-end')
     expect(texts.length).toBe(Math.min(bodyRows - rows, 1 + 16))
     await ui.unmount()
   }
+})
+
+test('the picture keeps its size, its setup and its feed while bodyRows shrinks; a new window resizes it', SLOW, async ($, on) => {
+  const w = world(on)
+  for (let k = 0; k < 20; k++) await $.tool.call({ tool: 'Read', file_path: `/a/${k}.ts` })
+  const viewport = { columns: 120, rows: 50 }
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', viewport })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  const sizeOf = async () => (await ui.find({ type: 'Image' }))!.props as { columns: number; rows: number }
+  const before = { ...(await sizeOf()) }
+  const texts = (await ui.findAll({ type: 'Text' })).length
+  const setups = w.posts.filter(p => path(p) === '/setup').length
+  await ui.redraw({ ...DOCK, scroll: { offset: 0, bodyRows: 26 } })
+  await w.clock.settle()
+  const after = await sizeOf()
+  expect([after.columns, after.rows]).toEqual([before.columns, before.rows])
+  expect([before.columns, before.rows]).toEqual([45, 20])
+  expect((await ui.findAll({ type: 'Text' })).length).toBe(texts)
+  expect(w.posts.filter(p => path(p) === '/setup').length).toBe(setups)
+  // A different window is a new layout.
+  await ui.unmount()
+  const other = await $.ui.mount({ ...PANE, props: { ...DOCK, scroll: { offset: 0, bodyRows: 26 } }, surface: 'terminal', viewport: { columns: 100, rows: 40 } })
+  await w.clock.settle()
+  const image = (await other.find({ type: 'Image' }))!.props as { columns: number; rows: number }
+  expect([image.columns, image.rows]).toEqual([34, 15])
+  const lastSetup = w.posts.filter(p => path(p) === '/setup').at(-1)!
+  expect(lastSetup.body).toMatchObject({ rows: 15 })
+  expect(w.posts.filter(p => path(p) === '/setup').length).toBe(setups + 1)
 })
 
 test('two alt refusals two seconds apart stop the helper and show text by themselves', SLOW, async ($, on) => {

@@ -16,6 +16,34 @@ export function ringBox(bodyRows: number, bodyColumns: number): { columns: numbe
   return { columns, rows }
 }
 
+/** The most feed rows under the picture. */
+export const FEED_MAX = 16
+
+/**
+ * The picture's layout, taken from the window and not from the room left while Claude works (ruling R19).
+ * Claude Code's bodyRows shrinks as its bottom area grows, so the box and the feed length use the largest bodyRows
+ * seen since the window (viewport, pane width) last changed.
+ */
+export class StableLayout {
+  private key = ''
+  private max = 0
+
+  update(
+    viewportColumns: number | undefined,
+    viewportRows: number | undefined,
+    bodyColumns: number,
+    bodyRows: number,
+  ): { box: { columns: number; rows: number } | undefined; feedRows: number } {
+    const key = viewportColumns === undefined || viewportRows === undefined ? `${bodyColumns}` : `${viewportColumns}x${viewportRows}x${bodyColumns}`
+    if (key !== this.key) {
+      this.key = key
+      this.max = bodyRows
+    } else this.max = Math.max(this.max, bodyRows)
+    const box = ringBox(this.max, bodyColumns)
+    return { box, feedRows: box === undefined ? 0 : Math.max(0, Math.min(FEED_MAX, this.max - box.rows - 1)) }
+  }
+}
+
 export type Env = Readonly<Record<string, string | undefined>>
 
 export const ENV_NAMES = ['TERM_PROGRAM', 'TERM', 'KITTY_WINDOW_ID', 'TMUX', 'ZELLIJ', 'STY', 'SSH_CONNECTION', 'SSH_TTY', 'TMPDIR', 'HOME'] as const
