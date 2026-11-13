@@ -2,6 +2,11 @@ import { expect, test } from 'claude-code/testing'
 import { Canvas, parseColor } from './paint/canvas'
 import { circle, dashed, fill, line, parsePath, rotateAbout, roundRect, stroke } from './paint/path'
 import { STATIONS, setupFrom } from './map'
+import { COVERAGE, STILL_TEXT, missing } from './paint/font'
+import { OUTLINE } from './paint/font-outline'
+import { STROKE } from './paint/font-stroke'
+import { drawText, textWidth } from './paint/text'
+import { stringsFor } from './text'
 
 const near = (a: number, b: number, eps = 1e-6) => expect(Math.abs(a - b)).toBeLessThan(eps)
 const WHITE = parseColor('#ffffff')
@@ -139,4 +144,47 @@ test('non-zero winding keeps same-direction nesting filled and cuts a reverse-di
   fill(hole, [sq(1, 1, 18, false), sq(6, 6, 8, true)], WHITE, 1)
   expect(hole.pixel(10, 10)[3]).toBe(0)
   expect(hole.pixel(3, 3)[3]).toBe(255)
+})
+
+const inkColumns = (c: Canvas): [number, number] => {
+  let l = c.width, r = -1
+  for (let y = 0; y < c.height; y++) for (let x = 0; x < c.width; x++) if (c.pixel(x, y)[3] > 0) { l = Math.min(l, x); r = Math.max(r, x) }
+  return [l, r]
+}
+
+test('the outline font covers every character the map can draw; the stroke font covers the still', () => {
+  expect(missing(OUTLINE, COVERAGE)).toEqual([])
+  expect(missing(STROKE, STILL_TEXT)).toEqual([])
+})
+
+test('the still text holds every station name in en, ru and de', () => {
+  const names = ['en', 'ru', 'de'].flatMap(l => Object.values(stringsFor(l).stations)).join('')
+  expect([...names].filter(ch => !STILL_TEXT.includes(ch))).toEqual([])
+})
+
+test('text anchored in the middle is centred on x less half the trailing letter-spacing', () => {
+  const adv = (OUTLINE.regular.advance / OUTLINE.regular.unitsPerEm) * 20
+  near(textWidth(OUTLINE, 'HHH', 20, 4), 3 * (adv + 4))
+  const c = new Canvas(200, 40)
+  drawText(c, OUTLINE, { runs: [{ text: 'HHH', color: WHITE }], x: 100, y: 30, size: 20, anchor: 'middle', letterSpacing: 4 })
+  const [l, r] = inkColumns(c)
+  near((l + r + 1) / 2, 98, 0.75)
+})
+
+test('a character the font lacks is a hollow box, and nothing throws', () => {
+  for (const font of [OUTLINE, STROKE]) {
+    const c = new Canvas(60, 40)
+    drawText(c, font, { runs: [{ text: '日', color: WHITE }], x: 10, y: 30, size: 20, anchor: 'start' })
+    const [l, r] = inkColumns(c)
+    expect(r - l).toBeGreaterThan(8)
+    expect(c.pixel(Math.round((l + r) / 2), 24)[3]).toBe(0)
+  }
+})
+
+test('a rim is drawn around the letters in its own colour', () => {
+  const c = new Canvas(80, 40)
+  drawText(c, OUTLINE, { runs: [{ text: 'O', color: WHITE }], x: 40, y: 30, size: 24, anchor: 'middle', rim: { color: parseColor('#0a0c11'), width: 5.6 } })
+  let x = 0
+  while (x < c.width && c.pixel(x, 22)[3] < 255) x++
+  expect(c.pixel(x, 22)).toEqual([10, 12, 17, 255])
 })
