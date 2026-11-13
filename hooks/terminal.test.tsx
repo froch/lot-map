@@ -1,0 +1,706 @@
+import { expect, mock, test } from 'claude-code/testing'
+import type { On } from 'claude-code'
+import { Coalescer, HelperPolicy, LineReader, PictureGate, helperPattern, StableLayout, isTag, newTag, ringBox, socketPath, terminalAllows } from './terminal'
+
+const ALT = 'the Image draws its alt here: this terminal draws no images'
+const NOT_MOUNTED = 'no Image of its own is mounted under key map'
+const STARTING = 'the terminal has not yet said whether it reads files on this machine; asked now, blit again'
+
+test('the ring box follows the pane and gives way to text below twelve rows', () => {
+  expect(ringBox(34, 89)).toEqual({ columns: 45, rows: 20 })
+  expect(ringBox(20, 89)).toEqual({ columns: 27, rows: 12 })
+  expect(ringBox(19, 89)).toBeUndefined()
+  expect(ringBox(100, 60)).toEqual({ columns: 60, rows: 26 })
+  expect(ringBox(34, 40)).toEqual({ columns: 40, rows: 17 })
+  expect(ringBox(34, 26)).toBeUndefined()
+})
+
+test('only Ghostty or kitty, outside tmux, zellij, screen and ssh, get a picture', () => {
+  expect(terminalAllows({ TERM_PROGRAM: 'ghostty' })).toBe(true)
+  expect(terminalAllows({ TERM: 'xterm-kitty' })).toBe(true)
+  expect(terminalAllows({ KITTY_WINDOW_ID: '1' })).toBe(true)
+  for (const env of [{ TERM_PROGRAM: 'iTerm.app' }, { TERM_PROGRAM: 'vscode' }, { TERM_PROGRAM: 'Apple_Terminal' }, {}]) expect(terminalAllows(env)).toBe(false)
+  for (const extra of [{ TMUX: '/x' }, { ZELLIJ: '0' }, { STY: '1.x' }, { SSH_CONNECTION: 'a' }, { SSH_TTY: '/dev/ttys1' }]) expect(terminalAllows({ TERM_PROGRAM: 'ghostty', ...extra })).toBe(false)
+})
+
+test('the socket path stays under 100 bytes, in TMPDIR when it fits and /tmp otherwise', () => {
+  expect(socketPath({ TMPDIR: '/var/folders/ab/cdefgh/T/' }, 'abcd1234')).toBe('/var/folders/ab/cdefgh/T/lot-map-abcd1234/h.sock')
+  expect(socketPath({ TMPDIR: `/${'x'.repeat(90)}` }, 'abcd1234')).toBe('/tmp/lot-map-abcd1234/h.sock')
+  expect(socketPath({}, 'abcd1234')).toBe('/tmp/lot-map-abcd1234/h.sock')
+  expect(newTag(() => 0.5)).toMatch(/^[a-z0-9]{8}$/)
+})
+
+test('pkill finds a helper by its socket tail, the dot matched literally, and only a well-formed tag is used', () => {
+  const pattern = helperPattern('abcd1234')
+  expect(pattern).toBe('lot-map-abcd1234/h\\.sock')
+  const found = new RegExp(pattern)
+  expect(found.test('bun /p/helper/painter.ts /var/folders/ab/cdefgh/T/lot-map-abcd1234/h.sock abcd1234')).toBe(true)
+  expect(found.test('bun /p/helper/painter.ts /tmp/lot-map-abcd1234/hXsock abcd1234')).toBe(false)
+  expect(found.test('bun /p/helper/painter.ts /tmp/lot-map-abcd1235/h.sock abcd1235')).toBe(false)
+  expect(isTag(newTag(Math.random))).toBe(true)
+  for (const bad of ['', 'abcd123', 'abcd12345', 'ABCD1234', '.*.*.*.*', 'abcd/234', 42, undefined]) expect(isTag(bad)).toBe(false)
+})
+
+test('StableLayout keeps the box and the feed while bodyRows shrinks and grows in one window', () => {
+  const layout = new StableLayout()
+  const first = layout.update(120, 50, 89, 34)
+  expect(first).toEqual({ box: { columns: 45, rows: 20 }, feedRows: 13 })
+  expect(layout.update(120, 50, 89, 28)).toEqual(first)
+  expect(layout.update(120, 50, 89, 34)).toEqual(first)
+})
+
+test('StableLayout recomputes when the window or the pane width changes', () => {
+  const layout = new StableLayout()
+  layout.update(120, 50, 89, 34)
+  expect(layout.update(120, 40, 89, 20)).toEqual({ box: { columns: 27, rows: 12 }, feedRows: 7 })
+  expect(layout.update(120, 40, 60, 20).box?.columns).toBe(27)
+  expect(new StableLayout().update(undefined, undefined, 89, 60).box).toEqual({ columns: 81, rows: 36 })
+})
+
+test('StableLayout grows once when a larger bodyRows arrives after a first reading taken while shrunk', () => {
+  const layout = new StableLayout()
+  expect(layout.update(120, 50, 89, 28).box).toEqual({ columns: 36, rows: 16 })
+  expect(layout.update(120, 50, 89, 34).box).toEqual({ columns: 45, rows: 20 })
+  expect(layout.update(120, 50, 89, 28).box).toEqual({ columns: 45, rows: 20 })
+})
+
+test('two alt refusals two seconds apart switch to text; a render a minute later reopens', () => {
+  const g = new PictureGate()
+  expect(g.rendered(0)).toEqual({ reopen: false })
+  expect(g.refused(ALT, 100)).toEqual({ next: 'carry-on' })
+  expect(g.refused(ALT, 1100)).toEqual({ next: 'carry-on' })
+  expect(g.refused(ALT, 2200)).toEqual({ next: 'text' })
+  expect(g.showsPicture()).toBe(false)
+  expect(g.rendered(30_000)).toEqual({ reopen: false })
+  expect(g.showsPicture()).toBe(false)
+  expect(g.rendered(62_300)).toEqual({ reopen: true })
+  expect(g.showsPicture()).toBe(true)
+})
+
+test('after a taken frame, alt and not-mounted refusals pause; the start-up message and others carry on', () => {
+  const g = new PictureGate()
+  g.accepted(0)
+  expect(g.refused(ALT, 10)).toEqual({ next: 'pause' })
+  expect(g.refused(NOT_MOUNTED, 20)).toEqual({ next: 'pause' })
+  expect(g.refused(STARTING, 30)).toEqual({ next: 'carry-on' })
+  expect(g.refused('too many blits this second', 40)).toEqual({ next: 'carry-on' })
+  expect(g.showsPicture()).toBe(true)
+})
+
+test('before any taken frame, a not-mounted refusal pauses too; the start-up message and others carry on', () => {
+  const g = new PictureGate()
+  expect(g.refused(NOT_MOUNTED, 10)).toEqual({ next: 'pause' })
+  expect(g.refused(STARTING, 20)).toEqual({ next: 'carry-on' })
+  expect(g.refused('too many blits this second', 30)).toEqual({ next: 'carry-on' })
+  expect(g.refused(NOT_MOUNTED, 40)).toEqual({ next: 'pause' })
+  expect(g.showsPicture()).toBe(true)
+})
+
+test('a helper that keeps dying is restarted twice, then given up on', () => {
+  const p = new HelperPolicy()
+  expect([p.exited(0), p.exited(2000), p.exited(9000)]).toEqual([{ restartIn: 1000 }, { restartIn: 5000 }, { giveUp: true }])
+  const q = new HelperPolicy()
+  expect([q.exited(0), q.exited(70_000)]).toEqual([{ restartIn: 1000 }, { restartIn: 1000 }])
+})
+
+test('board posts are at most ten a second, the newest winning, and say when the next is due', () => {
+  const c = new Coalescer<number>()
+  expect(c.offer(1, 0)).toBe(1)
+  expect(c.offer(2, 30)).toBeUndefined()
+  expect(c.offer(3, 60)).toBeUndefined()
+  expect(c.waitMs(60)).toBe(40)
+  expect(c.due(90)).toBeUndefined()
+  expect(c.due(100)).toBe(3)
+  expect(c.due(150)).toBeUndefined()
+  expect(c.waitMs(150)).toBeUndefined()
+})
+
+test('helper lines are read across pieces and malformed ones are dropped', () => {
+  const r = new LineReader()
+  expect(r.push('R\nF /lm-abcd1234-0 72')).toEqual([{ kind: 'R' }])
+  expect(r.push('7 680 41\nS 20 6.6 0.3 0\nnonsense\nF bad\nE no cc\n')).toEqual([
+    { kind: 'F', name: '/lm-abcd1234-0', width: 727, height: 680, generation: 41 },
+    { kind: 'S', text: '20 6.6 0.3 0' },
+    { kind: 'E', message: 'no cc' },
+  ])
+})
+
+// ---- Task 12: the pane wired to the helper --------------------------------------------------------
+
+const SLOW = { timeoutMs: 30000 }
+const DOCK = { title: 'Map', isFocused: false, bodyColumns: 89, placement: 'dock', scroll: { offset: 0, bodyRows: 34 }, view: {} } as const
+const PANE = { plugin: 'lot-map', component: 'Pane', requestId: 'lot-map', props: DOCK } as const
+const GHOSTTY = { TERM_PROGRAM: 'ghostty', TMPDIR: '/var/folders/ab/cdefgh/T/', HOME: '/Users/x' }
+const path = (p: { url: string }) => new URL(p.url).pathname
+
+type Clock = ReturnType<typeof mock.clock>
+type Spawn = (clock: Clock) => AsyncGenerator<{ stream: 'stdout'; text: string }, { value: { code: number | null; signal: string | null } }>
+
+/**
+ * A world with a fake helper that prints R, then F lines when told to (and, with `paints`, one for each /frame or
+ * /resume), and H every second of the mock clock, as the real one does; a `silent` one prints no H.
+ * `late` holds the n-th blit's answer that many ms; `pkillMs` holds the n-th pkill's.
+ */
+const world = (
+  on: On,
+  opts: {
+    env?: Record<string, string>
+    blit?: (n: number) => { deny?: string }
+    late?: (n: number) => number
+    paints?: boolean
+    silent?: boolean
+    pkillMs?: (n: number) => number
+    bun?: boolean
+    fetchOk?: boolean
+    status?: (path: string, n: number) => number
+    spawn?: Spawn
+    theme?: { value: string }
+  } = {},
+) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.env(on, opts.env ?? GHOSTTY)
+  const spawned: string[][] = []
+  const spawnedAt: number[] = []
+  const runs: string[][] = []
+  const killedAt: number[] = []
+  const posts: { url: string; body: unknown }[] = []
+  const asked = new Map<string, number>()
+  const blits: { name: string; generation: number; at: number }[] = []
+  const toasts: string[] = []
+  let stopped = 0
+  let painted = 0
+  let feed: (line: string) => void = () => {}
+  const frame = (k: number) => {
+    painted = Math.max(painted, k + 1)
+    feed(`F /lm-abcd1234-${k % 8} 727 680 ${k + 1}\n`)
+  }
+  const standard: Spawn = async function* (time) {
+    const lines: string[] = ['R\n']
+    let wake: (() => void) | undefined
+    let isAlive = true
+    const push = (line: string) => { lines.push(line); wake?.() }
+    feed = push
+    if (!opts.silent) void (async () => { while (isAlive) { await time.sleep(1000); if (isAlive) push('H\n') } })()
+    try {
+      while (true) {
+        while (lines.length > 0) yield { stream: 'stdout', text: lines.shift()! }
+        await new Promise<void>(r => { wake = r })
+      }
+    } finally { isAlive = false; stopped++ }
+  }
+  on('process.run', async (_, e) => {
+    runs.push([...e.argv])
+    if (e.argv[0] === 'pkill') {
+      const wait = opts.pkillMs?.(runs.filter(argv => argv[0] === 'pkill').length) ?? 0
+      if (wait > 0) await clock.sleep(wait)
+      killedAt.push(clock.now())
+      return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    return opts.bun === false ? { deny: 'not found' } : { value: { exitCode: 0, stdout: '1.4.4\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('fs.exists', () => ({ value: opts.bun !== false }))
+  on('process.spawn', async function* (_, e) { spawned.push([...e.argv]); spawnedAt.push(clock.now()); return yield* (opts.spawn ?? standard)(clock) })
+  on('http.fetch', (_, e) => {
+    posts.push({ url: e.url, body: JSON.parse(String(e.init?.body ?? 'null')) })
+    const route = path(e)
+    asked.set(route, (asked.get(route) ?? 0) + 1)
+    const status = opts.status?.(route, asked.get(route)!) ?? 200
+    if (opts.paints && status < 400 && (route === '/frame' || route === '/resume')) frame(painted)
+    return opts.fetchOk === false ? { deny: 'refused by policy' } : { value: { status, ok: status < 400, headers: {}, text: status < 400 ? '{}' : 'helper trouble' } }
+  })
+  on('ui.toast', (_, e) => { toasts.push(e.text); return { value: undefined } })
+  on('ui.blit', async (_, e) => {
+    const s = ('source' in e ? e.source : {}) as { shm: string; generation: number }
+    blits.push({ name: s.shm, generation: s.generation, at: clock.now() })
+    const n = blits.length
+    const wait = opts.late?.(n) ?? 0
+    if (wait > 0) await clock.sleep(wait)
+    return { value: opts.blit?.(n) ?? {} }
+  })
+  on('config.list', () => ({ value: opts.theme === undefined ? [] : [{ key: 'theme', label: 'Theme', kind: 'choice', value: opts.theme.value, provider: { plugin: 'engine', tier: 'core' }, isLocked: false }] }))
+  on('config.set', (_, e) => { if (opts.theme !== undefined) opts.theme.value = String(e.value); return { value: e.value } })
+  on('tool.call', () => ({ result: {} }))
+  return { clock, spawned, spawnedAt, runs, killedAt, posts, blits, toasts, stopped: () => stopped, frame }
+}
+
+const STATS = { command: 'lot-map', args: 'stats', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const
+
+test('in Ghostty the pane starts one helper, posts setup and board, and relays frames with their generation', SLOW, async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(w.spawned.length).toBe(1)
+  const tag = w.spawned[0]!.at(-1)!
+  expect(w.spawned[0]!.at(-2)).toBe(`/var/folders/ab/cdefgh/T/lot-map-${tag}/h.sock`)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  const first = (await ui.find({ type: 'Image' }))!.props.source as { width: number }
+  expect(first.width).toBe(1)
+  w.frame(0); w.frame(1)
+  await w.clock.settle()
+  expect(w.blits.map(b => [b.name, b.generation])).toEqual([['/lm-abcd1234-0', 1], ['/lm-abcd1234-1', 2]])
+  await ui.redraw()
+  const image = await ui.find({ type: 'Image' })
+  expect(image?.props).toMatchObject({ key: 'map', columns: 45, rows: 20 })
+  expect(image?.props.source).toEqual(first) // frames reach the Image by blit, never by its source
+})
+
+test('iTerm2 starts no helper and shows no picture', SLOW, async ($, on) => {
+  const w = world(on, { env: { TERM_PROGRAM: 'iTerm.app' } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.spawned.length).toBe(0)
+})
+
+test('tmux starts no helper and shows no picture', SLOW, async ($, on) => {
+  const w = world(on, { env: { ...GHOSTTY, TMUX: '/tmp/t' } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.spawned.length).toBe(0)
+})
+
+test('an inline pane, a short pane and a machine without bun show the text view', SLOW, async ($, on) => {
+  const w = world(on, { bun: false })
+  for (const props of [{ ...DOCK, placement: 'inline' }, { ...DOCK, scroll: { offset: 0, bodyRows: 19 } }, DOCK]) {
+    const ui = await $.ui.mount({ ...PANE, props, surface: 'terminal' } as never)
+    expect(await ui.find({ type: 'Image' })).toBeUndefined()
+    await ui.unmount()
+  }
+  expect(w.spawned.length).toBe(0)
+})
+
+test('with terminal set to text the pane draws todays text view', { ...SLOW, options: { terminal: 'text' } }, async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.spawned.length).toBe(0)
+})
+
+test('the feed is cut to fit under the picture, every row one line long', SLOW, async ($, on) => {
+  world(on)
+  for (let k = 0; k < 20; k++) {
+    if (k % 2 === 0) await $.tool.call({ tool: 'Read', file_path: `/a/${k}/${'p'.repeat(120)}.ts` })
+    else await $.tool.call({ tool: 'Bash', command: 'true', description: `${k} ${'x'.repeat(200)}` })
+  }
+  for (const [bodyRows, rows] of [[34, 20], [20, 12], [60, 36]] as const) {
+    // Each mount is its own window, so its layout starts afresh.
+    const ui = await $.ui.mount({ ...PANE, props: { ...DOCK, scroll: { offset: 0, bodyRows } }, surface: 'terminal', viewport: { columns: 200, rows: bodyRows + 10 } })
+    const texts = await ui.findAll({ type: 'Text' })
+    for (const t of texts) expect(t.props.wrap).toBe('truncate-end')
+    expect(texts.length).toBe(Math.min(bodyRows - rows, 1 + 16))
+    await ui.unmount()
+  }
+})
+
+test('the picture keeps its size, its setup and its feed while bodyRows shrinks; a new window resizes it', SLOW, async ($, on) => {
+  const w = world(on)
+  for (let k = 0; k < 20; k++) await $.tool.call({ tool: 'Read', file_path: `/a/${k}.ts` })
+  const viewport = { columns: 120, rows: 50 }
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', viewport })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  const sizeOf = async () => (await ui.find({ type: 'Image' }))!.props as { columns: number; rows: number }
+  const before = { ...(await sizeOf()) }
+  const texts = (await ui.findAll({ type: 'Text' })).length
+  const setups = w.posts.filter(p => path(p) === '/setup').length
+  await ui.redraw({ ...DOCK, scroll: { offset: 0, bodyRows: 26 } })
+  await w.clock.settle()
+  const after = await sizeOf()
+  expect([after.columns, after.rows]).toEqual([before.columns, before.rows])
+  expect([before.columns, before.rows]).toEqual([45, 20])
+  expect((await ui.findAll({ type: 'Text' })).length).toBe(texts)
+  expect(w.posts.filter(p => path(p) === '/setup').length).toBe(setups)
+  // A different window is a new layout.
+  await ui.unmount()
+  const other = await $.ui.mount({ ...PANE, props: { ...DOCK, scroll: { offset: 0, bodyRows: 26 } }, surface: 'terminal', viewport: { columns: 100, rows: 40 } })
+  await w.clock.settle()
+  const image = (await other.find({ type: 'Image' }))!.props as { columns: number; rows: number }
+  expect([image.columns, image.rows]).toEqual([34, 15])
+  const lastSetup = w.posts.filter(p => path(p) === '/setup').at(-1)!
+  expect(lastSetup.body).toMatchObject({ rows: 15 })
+  expect(w.posts.filter(p => path(p) === '/setup').length).toBe(setups + 1)
+})
+
+test('two alt refusals two seconds apart stop the helper and show text by themselves', SLOW, async ($, on) => {
+  const w = world(on, { blit: () => ({ deny: 'the Image draws its alt here: no images' }) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.advance(2100)
+  w.frame(1)
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  await w.clock.advance(1000) // the helper's next H: its loop sees the run has ended
+  expect(w.stopped()).toBe(1)
+})
+
+test('a not-mounted refusal pauses the helper, and the next render resumes it', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n === 2 ? { deny: 'no Image of its own is mounted under key map' } : {}) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0); w.frame(1)
+  await w.clock.settle()
+  expect(w.posts.map(path)).toContain('/pause')
+  await ui.redraw()
+  expect(w.posts.map(path).at(-1)).toBe('/resume')
+})
+
+test('board posts are coalesced to at most ten a second and the newest board arrives', SLOW, async ($, on) => {
+  const w = world(on)
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  for (let k = 0; k < 10; k++) await $.tool.call({ tool: 'Read', file_path: `/a/b${k}.ts` })
+  await w.clock.advance(1000)
+  const boards = w.posts.filter(p => path(p) === '/board')
+  expect(boards.length).toBeLessThanOrEqual(1 + 10)
+  expect(JSON.stringify(boards.at(-1)!.body)).toContain('b9.ts')
+})
+
+test('a helper that exits three times within a minute leaves the text view, and an E line counts as a failure', SLOW, async ($, on) => {
+  let starts = 0
+  const w = world(on, { spawn: async function* () { starts++; yield { stream: 'stdout' as const, text: starts === 1 ? 'E no cc\n' : 'S x\n' }; return { value: { code: 2, signal: null } } } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.advance(10_000)
+  expect(starts).toBe(3)
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+})
+
+test('a refused socket request is a helper failure: three within a minute give the text view and one toast', SLOW, async ($, on) => {
+  const w = world(on, { fetchOk: false })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeDefined() // one failure: a fresh helper comes in a second
+  await w.clock.advance(10_000)
+  expect(w.spawned.length).toBe(3)
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.toasts.length).toBe(1)
+  expect(w.toasts[0]).toContain('/setup')
+  expect(w.stopped()).toBe(3)
+})
+
+test('with Claude Code on a light theme and the map on auto, setup says light; a theme change posts setup again', SLOW, async ($, on) => {
+  const w = world(on, { theme: { value: 'light-daltonized' } })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  const setups = () => w.posts.filter(p => path(p) === '/setup').map(p => (p.body as { light: boolean }).light)
+  expect(setups()).toEqual([true])
+  await $.config.set({ key: 'theme', value: 'dark', previous: 'light-daltonized', provider: { plugin: 'engine', tier: 'core' }, origin: { kind: 'composer' } })
+  await w.clock.settle()
+  expect(setups()).toEqual([true, false])
+})
+
+test('/lot-map stats names the mode and the frames', SLOW, async ($, on) => {
+  const w = world(on)
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  const out = await $.command.run({ command: 'lot-map', args: 'stats', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
+  expect(out.text).toMatch(/^mode: picture/)
+  expect(out.text).toMatch(/frames: 1 taken · 0 refused/)
+})
+
+test('desktop still gets the Svg and no helper is started for it', SLOW, async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Svg' })).toBeDefined()
+  expect(w.spawned.length).toBe(0)
+})
+
+test('a pane shown again while the map is still asks the helper for a fresh frame, and only then', SLOW, async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  await ui.unmount()
+  await w.clock.advance(100)
+  let again = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  await again.unmount()
+  await w.clock.advance(300)
+  again = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  w.frame(1)
+  await w.clock.settle()
+  await again.redraw()
+  expect((await again.find({ type: 'Image' }))?.props.source).toMatchObject({ width: 1, height: 1 })
+  expect(w.blits.at(-1)).toMatchObject({ name: '/lm-abcd1234-1', generation: 2 })
+  expect(w.spawned.length).toBe(1)
+})
+
+test('the session keeps the helper tag in $.state, and the helper is started with it', SLOW, async ($, on) => {
+  const w = world(on)
+  const written: unknown[] = []
+  on('state.set', (_, e, next) => {
+    if (e.key === 'tag') written.push(e.value)
+    return next(e)
+  })
+  on('command.register', () => ({ value: { command: 'lot-map' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect(written.length).toBe(1)
+  expect(written[0]).toMatch(/^[a-z0-9]{8}$/)
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(w.spawned[0]!.at(-1)).toBe(written[0] as string)
+})
+
+test('a tag kept from before a reload names the next helper', SLOW, async ($, on) => {
+  const w = world(on)
+  on('state.get', (_, e, next) => (e.key === 'tag' ? { value: { value: 'kept0tag', version: 1 } } : next(e)))
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(w.spawned[0]!.slice(-2)).toEqual(['/var/folders/ab/cdefgh/T/lot-map-kept0tag/h.sock', 'kept0tag'])
+})
+
+test('a /board answered 500 stops the run, asks it to quit, and starts a fresh helper a second later', SLOW, async ($, on) => {
+  const w = world(on, { status: (route, n) => (route === '/board' && n === 1 ? 500 : 200) })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  const tag = w.spawned[0]!.at(-1)!
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/quit'])
+  await w.clock.advance(1000)
+  expect(w.spawnedAt).toEqual([1_000_000, 1_001_000])
+  expect(w.stopped()).toBe(1)
+  expect(w.runs.filter(argv => argv[0] === 'pkill')).toContainEqual(['pkill', '-TERM', '-f', `lot-map-${tag}/h\\.sock`])
+  expect(w.runs.filter(argv => argv[0] === 'pkill').length).toBe(2) // before each spawn; the first run had ended, so no backstop
+  expect(w.posts.map(path).slice(3)).toEqual(['/setup', '/board'])
+})
+
+test('a helper that never prints R is stopped after 5 s, killed a second later, and a fresh one started', SLOW, async ($, on) => {
+  const w = world(on, { spawn: async function* (time) { await time.sleep(600_000); return { value: { code: 0, signal: null } } } })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.advance(4999)
+  expect(w.spawned.length).toBe(1)
+  expect(w.posts).toEqual([])
+  await w.clock.advance(1)
+  expect(w.posts.map(path)).toEqual(['/quit'])
+  await w.clock.advance(1000)
+  expect(w.spawned.length).toBe(2)
+  expect(w.spawnedAt).toEqual([1_000_000, 1_006_000])
+  expect(w.runs.filter(argv => argv[0] === 'pkill').length).toBe(3) // before each spawn, and the backstop for the silent one
+})
+
+test('a still map switched to text by the gate ends its helper by the next H, and a reopen a minute later leaves one helper alive', SLOW, async ($, on) => {
+  const w = world(on, { blit: () => ({ deny: 'the Image draws its alt here: no images' }) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.advance(2100)
+  w.frame(1)
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.posts.map(path).at(-1)).toBe('/quit')
+  await w.clock.advance(1000)
+  expect(w.stopped()).toBe(1)
+  await w.clock.advance(60_000)
+  await $.tool.call({ tool: 'Read', file_path: '/a/b.ts' })
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeDefined()
+  expect(w.spawned.length).toBe(2)
+  expect(w.spawned.length - w.stopped()).toBe(1)
+  expect(w.runs.filter(argv => argv[0] === 'pkill').length).toBe(2)
+})
+
+// ---- a frame not taken is asked for again ---------------------------------------------------------
+
+const SHM = (k: number) => ({ shm: `/lm-abcd1234-${k % 8}`, format: 'rgba', width: 727, height: 680, generation: k + 1 })
+
+test('a board change after two frames redraws with the very same placeholder source, so no frame is re-sent', SLOW, async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  const placeholder = (await ui.find({ type: 'Image' }))!.props.source
+  w.frame(0); w.frame(1)
+  await w.clock.settle()
+  expect(w.blits.length).toBe(2)
+  await ui.redraw()
+  const before = (await ui.find({ type: 'Image' }))!.props.source
+  await $.tool.call({ tool: 'Read', file_path: '/a/b.ts' })
+  await w.clock.settle()
+  await ui.redraw()
+  const after = (await ui.find({ type: 'Image' }))!.props.source
+  expect(after).toEqual(before)
+  expect(after).toEqual(placeholder)
+  expect(after).not.toHaveProperty('shm')
+})
+
+test('a still map whose only frame meets the start-up refusal asks the helper again, and draws the next frame', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n === 1 ? { deny: STARTING } : {}), paints: true, silent: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0) // the one frame the setup and the empty board paint
+  await w.clock.settle()
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  await w.clock.advance(149)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  await w.clock.advance(1)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  expect(w.blits.map(b => b.name)).toEqual(['/lm-abcd1234-0', '/lm-abcd1234-1'])
+  await ui.redraw()
+  expect((await ui.find({ type: 'Image' }))?.props.source).toMatchObject({ width: 1, height: 1 })
+  expect(w.blits.at(-1)).toMatchObject({ name: SHM(1).shm, generation: SHM(1).generation })
+  await w.clock.advance(30_000)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  expect((await $.command.run(STATS)).text).toMatch(/frames: 1 taken · 1 refused · 0 dropped · 1 asked again/)
+})
+
+test('a frame let go at the blit cap is asked for again, and the fresh one is drawn', SLOW, async ($, on) => {
+  const w = world(on, { late: n => (n <= 8 ? 100 : 0), paints: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  for (let k = 0; k < 9; k++) w.frame(k)
+  await w.clock.settle()
+  expect(w.blits.length).toBe(8) // eight unanswered: the ninth is let go
+  await w.clock.advance(100)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  await w.clock.advance(50)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  expect(w.blits.map(b => b.generation).at(-1)).toBe(10)
+  await ui.redraw()
+  expect((await ui.find({ type: 'Image' }))?.props.source).toMatchObject({ width: 1, height: 1 })
+  expect((await $.command.run(STATS)).text).toMatch(/frames: 9 taken · 0 refused · 1 dropped · 1 asked again/)
+})
+
+test('a not-mounted refusal right after a render asked for a frame is asked again, not paused', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n === 2 ? { deny: NOT_MOUNTED } : {}), paints: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  await w.clock.advance(300)
+  await ui.redraw() // no frame for 300 ms: the render asks for one, which comes before the Image is mounted
+  await w.clock.settle()
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  await w.clock.advance(150)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame', '/frame'])
+  await ui.redraw()
+  expect((await ui.find({ type: 'Image' }))?.props.source).toMatchObject({ width: 1, height: 1 })
+  expect(w.blits.at(-1)).toMatchObject({ name: SHM(2).shm, generation: SHM(2).generation })
+  expect((await $.command.run(STATS)).text).toMatch(/helper: running/)
+})
+
+test('a not-mounted refusal before any frame was taken, with no render asking, pauses; the next render resumes', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n === 1 ? { deny: NOT_MOUNTED } : {}) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/pause'])
+  await w.clock.advance(1000)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/pause'])
+  await ui.redraw()
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/pause', '/resume'])
+})
+
+test('five refusals in a row stop the asking, and nothing more is posted for a still map', SLOW, async ($, on) => {
+  const w = world(on, { blit: () => ({ deny: STARTING }), paints: true, silent: true })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.advance(5000)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame', '/frame', '/frame', '/frame', '/frame'])
+  expect(w.blits.length).toBe(6)
+  await w.clock.advance(60_000)
+  expect(w.posts.length).toBe(7)
+  expect((await $.command.run(STATS)).text).toMatch(/frames: 0 taken · 6 refused · 0 dropped · 5 asked again/)
+})
+
+test('frames that keep coming are not asked for again while they come; the last one not taken is', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n <= 4 ? { deny: STARTING } : {}), paints: true })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  for (let k = 0; k < 4; k++) {
+    w.frame(k)
+    await w.clock.advance(50)
+  }
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  await w.clock.advance(100)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  expect(w.blits.length).toBe(5)
+})
+
+// ---- a body the helper rejects --------------------------------------------------------------------
+
+test('a /board answered 400 is a body the helper would not take: dropped and counted, with no restart', SLOW, async ($, on) => {
+  const w = world(on, { status: (route, n) => (route === '/board' && n === 1 ? 400 : 200), silent: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  await w.clock.advance(10_000)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  expect(w.spawned.length).toBe(1)
+  expect(w.stopped()).toBe(0)
+  expect(await ui.find({ type: 'Image' })).toBeDefined()
+  const out = (await $.command.run(STATS)).text
+  expect(out).toMatch(/helper: running · 0 restarts/)
+  expect(out).toMatch(/posts the helper rejected as malformed: 1/)
+})
+
+// ---- stopping and killing a helper ----------------------------------------------------------------
+
+test('a helper that ignores /quit gets SIGTERM a second later and SIGKILL two seconds after that, found by its socket', SLOW, async ($, on) => {
+  const w = world(on, { blit: () => ({ deny: ALT }), silent: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  const pattern = `lot-map-${w.spawned[0]!.at(-1)!}/h\\.sock`
+  w.frame(0)
+  await w.clock.advance(2100)
+  w.frame(1)
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.posts.map(path).at(-1)).toBe('/quit')
+  const pkills = () => w.runs.filter(argv => argv[0] === 'pkill')
+  expect(pkills()).toEqual([['pkill', '-TERM', '-f', pattern]]) // before the spawn
+  await w.clock.advance(999)
+  expect(pkills().length).toBe(1)
+  await w.clock.advance(1)
+  expect(pkills().at(-1)).toEqual(['pkill', '-TERM', '-f', pattern])
+  await w.clock.advance(1999)
+  expect(pkills().length).toBe(2)
+  await w.clock.advance(1)
+  expect(pkills()).toEqual([['pkill', '-TERM', '-f', pattern], ['pkill', '-TERM', '-f', pattern], ['pkill', '-KILL', '-f', pattern]])
+  await w.clock.advance(10_000)
+  expect(pkills().length).toBe(3)
+})
+
+test('a fresh helper is spawned only once the old one\'s kill has landed, and no SIGKILL follows once it runs', SLOW, async ($, on) => {
+  // The backstop's pkill answers slowly: without waiting for it, it would land after the fresh spawn.
+  const w = world(on, { status: (route, n) => (route === '/board' && n === 1 ? 500 : 200), silent: true, pkillMs: n => (n === 2 ? 500 : 0) })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/quit'])
+  await w.clock.advance(1000)
+  expect(w.runs.filter(argv => argv[0] === 'pkill').map(argv => argv[1])).toEqual(['-TERM', '-TERM'])
+  expect(w.spawned.length).toBe(1)
+  await w.clock.advance(500)
+  expect(w.spawnedAt).toEqual([1_000_000, 1_001_500])
+  expect(Math.max(...w.killedAt)).toBeLessThanOrEqual(w.spawnedAt[1]!)
+  await w.clock.advance(10_000)
+  expect(w.runs.filter(argv => argv[0] === 'pkill').map(argv => argv[1])).toEqual(['-TERM', '-TERM', '-TERM'])
+  expect(w.spawned.length).toBe(2)
+})
+
+test('a clock that fails while a silent helper is given up on leaves it stopped, and the next render starts a fresh one', SLOW, async ($, on) => {
+  let isClockDown = false
+  // Above the mock clock: it refuses the one read asked for while the clock is down.
+  on('clock.now', {}, (_, e, next) => {
+    if (!isClockDown) return next(e)
+    isClockDown = false
+    return { deny: 'the clock is gone' }
+  })
+  const w = world(on, { spawn: async function* (time) { await time.sleep(600_000); return { value: { code: 0, signal: null } } } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  isClockDown = true
+  await w.clock.advance(5000)
+  expect(isClockDown).toBe(false)
+  expect(w.posts.map(path)).toEqual(['/quit'])
+  await w.clock.advance(10_000)
+  expect(w.spawned.length).toBe(1)
+  expect((await $.command.run(STATS)).text).toMatch(/helper: stopped · 0 restarts/)
+  await ui.redraw()
+  await w.clock.settle()
+  expect(w.spawned.length).toBe(2)
+})

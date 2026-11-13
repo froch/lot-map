@@ -2,3 +2,5 @@
 *.log
 .claude-plugin/types/
 .mcpb-cache/
+scripts/font/vendor/
+scripts/golden-out/

@@ -1,6 +1,6 @@
 {
   "name": "lot-map",
-  "version": "0.3.6",
+  "version": "0.4.0",
   "description": "A live map beside the chat: memory, files, shell, web, model, agents, skills and hooks light up as they are used",
   "license": "MIT",
   "types": "./types/index.d.ts",
@@ -110,6 +110,16 @@
       ],
       "default": "you-top",
       "description": "Where you are on the map: at the top, or at the bottom with the network and the browser at the top."
+    },
+    "terminal": {
+      "type": "string",
+      "title": "In the terminal",
+      "options": [
+        "picture",
+        "text"
+      ],
+      "default": "picture",
+      "description": "How the map shows in a terminal: as a moving picture in Ghostty or kitty (needs bun; uses shared memory and a local socket), or as text."
     }
   }
 }

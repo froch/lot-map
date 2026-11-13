@@ -39,6 +39,7 @@ export type Board = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'lot-map': { board: Shaped<Board> }
+    /** The board, and the tag that names the helper's socket and shared-memory frames for the session. */
+    'lot-map': { board: Shaped<Board>; tag: string }
   }
 }

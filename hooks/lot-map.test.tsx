@@ -2,7 +2,10 @@ import { expect, test } from 'claude-code/testing'
 
 import type { Board } from '../types'
 import type { Entry } from '../types'
-import { COLOR_NAMES, TRAIL_FADE_MS, TRAIL_HOLD_MS, classify, clean, drawMap, firstLine, foldRows, formatMs, memoryIds, routeOf, setupFrom } from './map'
+import { classify, clean, firstLine, foldRows, formatMs, memoryIds, setupFrom } from './map'
+import { COLOR_NAMES } from './palette'
+import { TRAIL_FADE_MS, TRAIL_HOLD_MS, routeOf } from './scene'
+import { drawMap } from './svg'
 import { stringsFor } from './text'
 
 const PANE = {
