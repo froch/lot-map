@@ -525,3 +525,19 @@ test('frames that keep coming are not asked for again while they come; the last 
   expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
   expect(w.blits.length).toBe(5)
 })
+
+// ---- a body the helper rejects --------------------------------------------------------------------
+
+test('a /board answered 400 is a body the helper would not take: dropped and counted, with no restart', SLOW, async ($, on) => {
+  const w = world(on, { status: (route, n) => (route === '/board' && n === 1 ? 400 : 200), silent: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  await w.clock.advance(10_000)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  expect(w.spawned.length).toBe(1)
+  expect(w.stopped()).toBe(0)
+  expect(await ui.find({ type: 'Image' })).toBeDefined()
+  const out = (await $.command.run(STATS)).text
+  expect(out).toMatch(/helper: running · 0 restarts/)
+  expect(out).toMatch(/posts the helper rejected as malformed: 1/)
+})

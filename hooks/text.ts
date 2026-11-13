@@ -26,7 +26,8 @@ export type PictureStats = {
   blitMs?: { average: number; p95: number }
   lastS?: string
   lastE?: string
-  posts: { sent: number; coalesced: number }
+  /** `rejected`: setups and boards the helper answered 400, a body it would not take. */
+  posts: { sent: number; coalesced: number; rejected: number }
 }
 
 /** The words of `/lot-map stats` in one language; `statsIn` lays them out the same way in all of them. */
@@ -44,6 +45,7 @@ type StatsWords = {
   lastE: (line: string) => string
   none: string
   posts: (sent: number, coalesced: number) => string
+  rejected: (n: number) => string
   decimal: (n: number) => string
 }
 
@@ -59,6 +61,7 @@ const statsIn =
       w.lastS(s.lastS ?? w.none),
       ...(s.lastE === undefined ? [] : [w.lastE(s.lastE)]),
       w.posts(s.posts.sent, s.posts.coalesced),
+      ...(s.posts.rejected === 0 ? [] : [w.rejected(s.posts.rejected)]),
     ].join('\n')
 
 const point = (n: number): string => n.toFixed(1)
@@ -177,6 +180,7 @@ const en: Strings = {
     lastE: line => `helper's last E line: ${line}`,
     none: 'none',
     posts: (sent, coalesced) => `board posts: ${sent} sent · ${coalesced} coalesced`,
+    rejected: n => `posts the helper rejected as malformed: ${n}`,
     decimal: point,
   }),
   helperGaveUp: cause => `The map's picture helper failed three times within a minute (${cause}), so the map shows as text.`,
@@ -253,6 +257,7 @@ const ru: Strings = {
     lastE: line => `последняя строка E помощника: ${line}`,
     none: 'нет',
     posts: (sent, coalesced) => `состояние карты: отправлено ${sent} · объединено ${coalesced}`,
+    rejected: n => `отправок, которые помощник отверг как некорректные: ${n}`,
     decimal: point,
   }),
   helperGaveUp: cause => `Помощник, который рисует картинку карты, трижды за минуту дал сбой (${cause}), и карта показывается текстом.`,
@@ -329,6 +334,7 @@ const es: Strings = {
     lastE: line => `última línea E del ayudante: ${line}`,
     none: 'ninguna',
     posts: (sent, coalesced) => `estados del mapa: ${sent} enviados · ${coalesced} fusionados`,
+    rejected: n => `envíos que el ayudante rechazó por mal formados: ${n}`,
     decimal: point,
   }),
   helperGaveUp: cause => `El ayudante que dibuja la imagen del mapa falló tres veces en un minuto (${cause}); el mapa se muestra como texto.`,
@@ -406,6 +412,7 @@ const fr: Strings = {
     lastE: line => `dernière ligne E de l'auxiliaire : ${line}`,
     none: 'aucune',
     posts: (sent, coalesced) => `états de la carte : ${sent} envoyé${sent > 1 ? 's' : ''} · ${coalesced} fusionné${coalesced > 1 ? 's' : ''}`,
+    rejected: n => `envois refusés par l'auxiliaire comme mal formés : ${n}`,
     decimal: comma,
   }),
   helperGaveUp: cause => `L'auxiliaire qui dessine l'image de la carte a échoué trois fois en une minute (${cause}) ; la carte s'affiche en texte.`,
@@ -482,6 +489,7 @@ const de: Strings = {
     lastE: line => `letzte E-Zeile des Helfers: ${line}`,
     none: 'keine',
     posts: (sent, coalesced) => `Kartenstände: ${sent} gesendet · ${coalesced} zusammengefasst`,
+    rejected: n => `vom Helfer als fehlerhaft abgelehnte Sendungen: ${n}`,
     decimal: comma,
   }),
   helperGaveUp: cause => `Der Bildhelfer der Karte ist dreimal in einer Minute ausgefallen (${cause}); die Karte wird als Text gezeigt.`,

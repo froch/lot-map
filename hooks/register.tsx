@@ -126,6 +126,7 @@ type Picture = {
   restarts: number
   sent: number
   coalesced: number
+  rejected: number
 }
 
 const freshPicture = (): Picture => ({
@@ -156,17 +157,19 @@ const freshPicture = (): Picture => ({
   restarts: 0,
   sent: 0,
   coalesced: 0,
+  rejected: 0,
 })
 
 const oneLine = (failure: unknown): string => firstLine(failure instanceof Error ? failure.message : String(failure), 120)
 
-/** Why a request to the helper came to nothing; undefined when it was answered ok. */
-async function reached(path: string, request: () => Promise<HttpResponse>): Promise<string | undefined> {
+/** Why a request to the helper came to nothing, with the status it was answered; undefined when it was answered ok. */
+async function reached(path: string, request: () => Promise<HttpResponse>): Promise<{ status?: number; cause: string } | undefined> {
   try {
     const answer = await request()
-    return answer.ok ? undefined : `${path} ${answer.status}${answer.text.trim() === '' ? '' : `: ${firstLine(answer.text, 120)}`}`
+    if (answer.ok) return undefined
+    return { status: answer.status, cause: `${path} ${answer.status}${answer.text.trim() === '' ? '' : `: ${firstLine(answer.text, 120)}`}` }
   } catch (failure) {
-    return `${path}: ${oneLine(failure)}`
+    return { cause: `${path}: ${oneLine(failure)}` }
   }
 }
 
@@ -189,7 +192,7 @@ function statsOf(pic: Picture): PictureStats {
     ...(ms.length === 0 ? {} : { blitMs: { average: ms.reduce((a, b) => a + b, 0) / ms.length, p95: ms[Math.min(ms.length - 1, Math.floor(ms.length * 0.95))]! } }),
     ...(pic.lastS === undefined ? {} : { lastS: pic.lastS }),
     ...(pic.lastE === undefined ? {} : { lastE: pic.lastE }),
-    posts: { sent: pic.sent, coalesced: pic.coalesced },
+    posts: { sent: pic.sent, coalesced: pic.coalesced, rejected: pic.rejected },
   }
 }
 
@@ -617,11 +620,16 @@ export const register: Register = (on, options) => {
             else pic.helper = 'stopped'
           })
         }
-        /** POSTs to the helper; a refusal or a failure is the run's failure. */
+        /**
+         * POSTs to the helper; a refusal or a failure is the run's failure. A setup or a board answered 400 is a body
+         * the helper would not take, not a helper in trouble: that post is dropped and counted.
+         */
         const post = (run: Run, path: string, body = '{}'): Promise<unknown> =>
           quietly(async () => {
-            const cause = await reached(path, () => $.http.fetch(`${HELPER}${path}`, { method: 'POST', body, socketPath: run.socket }))
-            if (cause !== undefined) await fail(run, cause)
+            const trouble = await reached(path, () => $.http.fetch(`${HELPER}${path}`, { method: 'POST', body, socketPath: run.socket }))
+            if (trouble === undefined) return
+            if (trouble.status === 400 && (path === '/setup' || path === '/board')) pic.rejected++
+            else await fail(run, trouble.cause)
           })
         const postBoard = async (run: Run, b: Board, at: number): Promise<void> => {
           pic.sent++
