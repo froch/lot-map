@@ -43,6 +43,12 @@ export function newTag(random: () => number): string {
   return tag
 }
 
+/** A tag as `newTag` makes it: 8 of [a-z0-9]. Anything else kept under the tag's key is not used. */
+export const isTag = (value: unknown): value is string => typeof value === 'string' && /^[a-z0-9]{8}$/.test(value)
+
+/** What `pkill -f` matches to find the helper of a tag: its socket path's tail, as an extended regular expression. */
+export const helperPattern = (tag: string): string => `lot-map-${tag}/h\\.sock`
+
 export type Refusal = { next: 'text' } | { next: 'pause' } | { next: 'carry-on' }
 
 const ALT_PREFIX = 'the Image draws its alt here:'

@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { Coalescer, HelperPolicy, LineReader, PictureGate, newTag, ringBox, socketPath, terminalAllows } from './terminal'
+import { Coalescer, HelperPolicy, LineReader, PictureGate, helperPattern, isTag, newTag, ringBox, socketPath, terminalAllows } from './terminal'
 
 const ALT = 'the Image draws its alt here: this terminal draws no images'
 const NOT_MOUNTED = 'no Image of its own is mounted under key map'
@@ -28,6 +28,17 @@ test('the socket path stays under 100 bytes, in TMPDIR when it fits and /tmp oth
   expect(socketPath({ TMPDIR: `/${'x'.repeat(90)}` }, 'abcd1234')).toBe('/tmp/lot-map-abcd1234/h.sock')
   expect(socketPath({}, 'abcd1234')).toBe('/tmp/lot-map-abcd1234/h.sock')
   expect(newTag(() => 0.5)).toMatch(/^[a-z0-9]{8}$/)
+})
+
+test('pkill finds a helper by its socket tail, the dot matched literally, and only a well-formed tag is used', () => {
+  const pattern = helperPattern('abcd1234')
+  expect(pattern).toBe('lot-map-abcd1234/h\\.sock')
+  const found = new RegExp(pattern)
+  expect(found.test('bun /p/helper/painter.ts /var/folders/ab/cdefgh/T/lot-map-abcd1234/h.sock abcd1234')).toBe(true)
+  expect(found.test('bun /p/helper/painter.ts /tmp/lot-map-abcd1234/hXsock abcd1234')).toBe(false)
+  expect(found.test('bun /p/helper/painter.ts /tmp/lot-map-abcd1235/h.sock abcd1235')).toBe(false)
+  expect(isTag(newTag(Math.random))).toBe(true)
+  for (const bad of ['', 'abcd123', 'abcd12345', 'ABCD1234', '.*.*.*.*', 'abcd/234', 42, undefined]) expect(isTag(bad)).toBe(false)
 })
 
 test('two alt refusals two seconds apart switch to text; a render a minute later reopens', () => {
@@ -105,7 +116,7 @@ type Spawn = (clock: Clock) => AsyncGenerator<{ stream: 'stdout'; text: string }
 /**
  * A world with a fake helper that prints R, then F lines when told to (and, with `paints`, one for each /frame or
  * /resume), and H every second of the mock clock, as the real one does; a `silent` one prints no H.
- * `late` holds the n-th blit's answer that many ms.
+ * `late` holds the n-th blit's answer that many ms; `pkillMs` holds the n-th pkill's.
  */
 const world = (
   on: On,
@@ -115,6 +126,7 @@ const world = (
     late?: (n: number) => number
     paints?: boolean
     silent?: boolean
+    pkillMs?: (n: number) => number
     bun?: boolean
     fetchOk?: boolean
     status?: (path: string, n: number) => number
@@ -127,6 +139,7 @@ const world = (
   const spawned: string[][] = []
   const spawnedAt: number[] = []
   const runs: string[][] = []
+  const killedAt: number[] = []
   const posts: { url: string; body: unknown }[] = []
   const asked = new Map<string, number>()
   const blits: { name: string; generation: number; at: number }[] = []
@@ -152,9 +165,14 @@ const world = (
       }
     } finally { isAlive = false; stopped++ }
   }
-  on('process.run', (_, e) => {
+  on('process.run', async (_, e) => {
     runs.push([...e.argv])
-    if (e.argv[0] === 'pkill') return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[0] === 'pkill') {
+      const wait = opts.pkillMs?.(runs.filter(argv => argv[0] === 'pkill').length) ?? 0
+      if (wait > 0) await clock.sleep(wait)
+      killedAt.push(clock.now())
+      return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     return opts.bun === false ? { deny: 'not found' } : { value: { exitCode: 0, stdout: '1.4.4\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('fs.exists', () => ({ value: opts.bun !== false }))
@@ -179,7 +197,7 @@ const world = (
   on('config.list', () => ({ value: opts.theme === undefined ? [] : [{ key: 'theme', label: 'Theme', kind: 'choice', value: opts.theme.value, provider: { plugin: 'engine', tier: 'core' }, isLocked: false }] }))
   on('config.set', (_, e) => { if (opts.theme !== undefined) opts.theme.value = String(e.value); return { value: e.value } })
   on('tool.call', () => ({ result: {} }))
-  return { clock, spawned, spawnedAt, runs, posts, blits, toasts, stopped: () => stopped, frame }
+  return { clock, spawned, spawnedAt, runs, killedAt, posts, blits, toasts, stopped: () => stopped, frame }
 }
 
 const STATS = { command: 'lot-map', args: 'stats', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const
@@ -384,12 +402,12 @@ test('a /board answered 500 stops the run, asks it to quit, and starts a fresh h
   const w = world(on, { status: (route, n) => (route === '/board' && n === 1 ? 500 : 200) })
   await $.ui.mount({ ...PANE, surface: 'terminal' })
   await w.clock.settle()
-  const socket = w.spawned[0]!.at(-2)!
+  const tag = w.spawned[0]!.at(-1)!
   expect(w.posts.map(path)).toEqual(['/setup', '/board', '/quit'])
   await w.clock.advance(1000)
   expect(w.spawnedAt).toEqual([1_000_000, 1_001_000])
   expect(w.stopped()).toBe(1)
-  expect(w.runs.filter(argv => argv[0] === 'pkill')).toContainEqual(['pkill', '-TERM', '-f', socket])
+  expect(w.runs.filter(argv => argv[0] === 'pkill')).toContainEqual(['pkill', '-TERM', '-f', `lot-map-${tag}/h\\.sock`])
   expect(w.runs.filter(argv => argv[0] === 'pkill').length).toBe(2) // before each spawn; the first run had ended, so no backstop
   expect(w.posts.map(path).slice(3)).toEqual(['/setup', '/board'])
 })
@@ -540,4 +558,71 @@ test('a /board answered 400 is a body the helper would not take: dropped and cou
   const out = (await $.command.run(STATS)).text
   expect(out).toMatch(/helper: running · 0 restarts/)
   expect(out).toMatch(/posts the helper rejected as malformed: 1/)
+})
+
+// ---- stopping and killing a helper ----------------------------------------------------------------
+
+test('a helper that ignores /quit gets SIGTERM a second later and SIGKILL two seconds after that, found by its socket', SLOW, async ($, on) => {
+  const w = world(on, { blit: () => ({ deny: ALT }), silent: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  const pattern = `lot-map-${w.spawned[0]!.at(-1)!}/h\\.sock`
+  w.frame(0)
+  await w.clock.advance(2100)
+  w.frame(1)
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.posts.map(path).at(-1)).toBe('/quit')
+  const pkills = () => w.runs.filter(argv => argv[0] === 'pkill')
+  expect(pkills()).toEqual([['pkill', '-TERM', '-f', pattern]]) // before the spawn
+  await w.clock.advance(999)
+  expect(pkills().length).toBe(1)
+  await w.clock.advance(1)
+  expect(pkills().at(-1)).toEqual(['pkill', '-TERM', '-f', pattern])
+  await w.clock.advance(1999)
+  expect(pkills().length).toBe(2)
+  await w.clock.advance(1)
+  expect(pkills()).toEqual([['pkill', '-TERM', '-f', pattern], ['pkill', '-TERM', '-f', pattern], ['pkill', '-KILL', '-f', pattern]])
+  await w.clock.advance(10_000)
+  expect(pkills().length).toBe(3)
+})
+
+test('a fresh helper is spawned only once the old one\'s kill has landed, and no SIGKILL follows once it runs', SLOW, async ($, on) => {
+  // The backstop's pkill answers slowly: without waiting for it, it would land after the fresh spawn.
+  const w = world(on, { status: (route, n) => (route === '/board' && n === 1 ? 500 : 200), silent: true, pkillMs: n => (n === 2 ? 500 : 0) })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/quit'])
+  await w.clock.advance(1000)
+  expect(w.runs.filter(argv => argv[0] === 'pkill').map(argv => argv[1])).toEqual(['-TERM', '-TERM'])
+  expect(w.spawned.length).toBe(1)
+  await w.clock.advance(500)
+  expect(w.spawnedAt).toEqual([1_000_000, 1_001_500])
+  expect(Math.max(...w.killedAt)).toBeLessThanOrEqual(w.spawnedAt[1]!)
+  await w.clock.advance(10_000)
+  expect(w.runs.filter(argv => argv[0] === 'pkill').map(argv => argv[1])).toEqual(['-TERM', '-TERM', '-TERM'])
+  expect(w.spawned.length).toBe(2)
+})
+
+test('a clock that fails while a silent helper is given up on leaves it stopped, and the next render starts a fresh one', SLOW, async ($, on) => {
+  let isClockDown = false
+  // Above the mock clock: it refuses the one read asked for while the clock is down.
+  on('clock.now', {}, (_, e, next) => {
+    if (!isClockDown) return next(e)
+    isClockDown = false
+    return { deny: 'the clock is gone' }
+  })
+  const w = world(on, { spawn: async function* (time) { await time.sleep(600_000); return { value: { code: 0, signal: null } } } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  isClockDown = true
+  await w.clock.advance(5000)
+  expect(isClockDown).toBe(false)
+  expect(w.posts.map(path)).toEqual(['/quit'])
+  await w.clock.advance(10_000)
+  expect(w.spawned.length).toBe(1)
+  expect((await $.command.run(STATS)).text).toMatch(/helper: stopped · 0 restarts/)
+  await ui.redraw()
+  await w.clock.settle()
+  expect(w.spawned.length).toBe(2)
 })

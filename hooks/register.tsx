@@ -7,7 +7,7 @@ import type { Setup } from './map'
 import { boardBody, setupBody } from './helper-bodies'
 import { DARK, LIGHT, lightPairs } from './palette'
 import { drawMap } from './svg'
-import { Coalescer, HelperPolicy, LineReader, PictureGate, isNotMounted, newTag, ringBox, socketPath, terminalAllows } from './terminal'
+import { Coalescer, HelperPolicy, LineReader, PictureGate, helperPattern, isNotMounted, isTag, newTag, ringBox, socketPath, terminalAllows } from './terminal'
 import type { Env } from './terminal'
 import type { HelperState, PictureStats, TextReason } from './text'
 
@@ -41,8 +41,10 @@ const HELPER = 'http://helper'
 const STALE_MS = 250
 /** A helper that has not printed R this long after its spawn is taken for hung. */
 const LISTEN_MS = 5000
-/** A helper asked to quit whose loop has not ended this long after is killed. */
+/** A helper asked to quit whose loop has not ended this long after is sent SIGTERM. */
 const QUIT_MS = 1000
+/** One whose loop has still not ended this long after SIGTERM is sent SIGKILL. */
+const KILL_MS = 2000
 /** Blits not yet answered past this many, a frame is let go: the helper unlinks what nobody read. */
 const IN_FLIGHT_MAX = 8
 /** A frame the Image did not take, still the newest this long after, is asked for again with /frame. */
@@ -61,6 +63,8 @@ type PixelSource = { rgba: string; width: number; height: number }
 
 /** One helper process, from its spawn to the end of its reading loop. A run no longer current does nothing. */
 type Run = {
+  /** Which run of the module this is: the newest while no later one has started. */
+  number: number
   tag: string
   socket: string
   /** It printed R. */
@@ -89,6 +93,10 @@ type Picture = {
   coalescer: Coalescer<Board>
   /** The helper run in force: a loop, a blit, a post or a timer of any other run does nothing. */
   current?: Run
+  /** How many runs have started: the newest run's number. */
+  runs: number
+  /** A pkill under way: the next spawn waits for it, so it never lands on the fresh helper. */
+  killing?: Promise<unknown>
   helper: HelperState
   paused: boolean
   /** The newest frame the Image took: what a redraw draws, the engine never sending it again. */
@@ -134,6 +142,7 @@ const freshPicture = (): Picture => ({
   gate: new PictureGate(),
   policy: new HelperPolicy(),
   coalescer: new Coalescer<Board>(),
+  runs: 0,
   helper: 'idle',
   paused: false,
   lastFrameSeq: 0,
@@ -327,7 +336,7 @@ export const register: Register = (on, options) => {
     await quietly(async () => {
       // Made once a session and kept, so a reloaded module's helper takes the same names and cleans what was left.
       const stored = await read($, tagRef)
-      const tag = (pic.tag ??= stored || newTag(Math.random))
+      const tag = (pic.tag ??= isTag(stored) ? stored : newTag(Math.random))
       if (stored !== tag) await update($, tagRef, () => tag)
     })
     await quietly(() => $.command.register({ name: 'lot-map', description: t.command }))
@@ -584,7 +593,19 @@ export const register: Register = (on, options) => {
         const env = facts.env
         const rowsAvailable = box.rows
 
-        /** Ends a run: it is stale at once, then asked to quit, and killed if its loop has not ended a second later. */
+        /**
+         * Sends the run's helper a signal, found by its socket path, unless its loop has ended or a newer run exists
+         * (that run's pkill before its spawn covers the old helper); says whether it sent one.
+         */
+        const kill = (run: Run, signal: 'TERM' | 'KILL'): boolean => {
+          if (run.hasEnded || run.number !== pic.runs) return false
+          pic.killing = quietly(() => $.process.run(['pkill', `-${signal}`, '-f', helperPattern(run.tag)], { timeoutMs: 5000 }))
+          return true
+        }
+        /**
+         * Ends a run: it is stale at once, then asked to quit; a loop not ended a second later gets SIGTERM, and one
+         * not ended two seconds after that SIGKILL, each only while no newer run exists.
+         */
         const stop = (run: Run, state: HelperState): void => {
           if (pic.current === run) {
             pic.current = undefined
@@ -593,8 +614,13 @@ export const register: Register = (on, options) => {
           }
           if (run.hasEnded) return
           void quietly(() => $.http.fetch(`${HELPER}/quit`, { method: 'POST', body: '{}', socketPath: run.socket }))
-          $.clock.after(QUIT_MS, () => {
-            if (!run.hasEnded) void quietly(() => $.process.run(['pkill', '-TERM', '-f', run.socket], { timeoutMs: 5000 }))
+          void quietly(async () => {
+            $.clock.after(QUIT_MS, () => {
+              if (!kill(run, 'TERM')) return
+              void quietly(async () => {
+                $.clock.after(KILL_MS, () => void kill(run, 'KILL'))
+              })
+            })
           })
         }
         /**
@@ -605,7 +631,13 @@ export const register: Register = (on, options) => {
           if (run.hasFailed || run !== pic.current) return
           run.hasFailed = true
           stop(run, 'restarting')
-          const next = pic.policy.exited(await $.clock.now())
+          const at = await quietly(() => $.clock.now())
+          if (at === undefined) {
+            // No time to count the failure by, so no restart is timed: the next render starts a fresh helper.
+            if (pic.current === undefined && pic.helper === 'restarting') pic.helper = 'stopped'
+            return
+          }
+          const next = pic.policy.exited(at)
           if ('giveUp' in next) {
             pic.helper = 'given-up'
             pic.blocked = { reason: 'helper', cause }
@@ -766,7 +798,15 @@ export const register: Register = (on, options) => {
          * next piece, at the latest the helper's H a second later, and leaving the loop kills the child.
          */
         const start = (tag: string): void => {
-          const run: Run = { tag, socket: socketPath(env, tag), isListening: false, isFed: false, hasEnded: false, hasFailed: false }
+          const run: Run = {
+            number: ++pic.runs,
+            tag,
+            socket: socketPath(env, tag),
+            isListening: false,
+            isFed: false,
+            hasEnded: false,
+            hasFailed: false,
+          }
           pic.current = run
           pic.helper = 'starting'
           pic.paused = false
@@ -778,12 +818,15 @@ export const register: Register = (on, options) => {
           void quietly(async () => {
             let cause = 'the helper exited'
             try {
+              // A kill of an earlier run's helper lands before this spawn, never on the fresh helper.
+              await pic.killing
+              if (run !== pic.current) return
               // Two helpers never share a tag: one that outlived its run is ended first ("no process" is fine).
-              await quietly(() => $.process.run(['pkill', '-TERM', '-f', run.socket], { timeoutMs: 5000 }))
+              await quietly(() => $.process.run(['pkill', '-TERM', '-f', helperPattern(tag)], { timeoutMs: 5000 }))
               if (run !== pic.current) return
               const child = $.process.spawn({ argv: [bun, `${$.plugin.root}/helper/painter.ts`, run.socket, tag] })
               $.clock.after(LISTEN_MS, () => {
-                if (run === pic.current && !run.isListening) void fail(run, `no R within ${LISTEN_MS / 1000} s`)
+                if (run === pic.current && !run.isListening) void quietly(() => fail(run, `no R within ${LISTEN_MS / 1000} s`))
               })
               const reader = new LineReader()
               reading: for await (const piece of child) {
@@ -853,7 +896,11 @@ export const register: Register = (on, options) => {
             const config = await quietly(() => $.config.list())
             pic.themeRow = String(config?.find(row => row.key === 'theme')?.value ?? '')
           }
-          const tag = (pic.tag ??= (await quietly(() => read($, tagRef))) || newTag(Math.random))
+          if (pic.tag === undefined) {
+            const stored = await quietly(() => read($, tagRef))
+            pic.tag = isTag(stored) ? stored : newTag(Math.random)
+          }
+          const tag = pic.tag
           const run = pic.current
           if (pic.helper === 'idle' || pic.helper === 'stopped') start(tag)
           else if (run?.isFed === true) feedHelper(run)
