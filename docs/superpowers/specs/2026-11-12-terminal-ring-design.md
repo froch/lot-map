@@ -140,7 +140,7 @@ Notes on the rule:
 
 - **Pictures work** once any blit is accepted. No more probing until a render follows a refusal.
 - **Probe.** After the first render, and after a render that follows a refusal, the loop sends the current frame as a probe blit.
-- **No pictures.** An alt refusal (`the Image draws its alt here:`) seen twice at least 2 s apart, with no accepted blit between, switches the pane to the text view. It is not permanent: the next render at least 60 s later shows the picture again and probes. A slow start or an ssh session therefore recovers.
+- **No pictures.** The first alt refusal (`the Image draws its alt here:`) schedules a second probe 2 s later. A second alt refusal at least 2 s after the first, with no blit ever accepted, switches the pane to the text view. It is not permanent: the next render at least 60 s later shows the picture again and probes. A slow start or an ssh session therefore recovers.
 - Other refusals never switch modes.
 - Today's text view is unchanged.
 
@@ -155,7 +155,7 @@ Notes on the rule:
 **The candidates.** The build's first step paints the same still with each, in the docked pane beside real terminal text, and the person picks one:
 
 1. Outlines from an open font, e.g. JetBrains Mono (SIL OFL 1.1), regular and bold, extracted by a development-time script into a generated data file. If chosen, ship the OFL text and state the data's size in the README.
-2. A small single-stroke font drawn by hand, painted with the line painter. Bold is a wider stroke.
+2. A single-stroke font, painted with the line painter: Hershey Roman Simplex for Latin, each glyph centred in a fixed advance, with Cyrillic and `ä ö ü ß` drawn by hand. Bold is a wider stroke. For the checkpoint it covers only the still's text. Hershey's Cyrillic sets are double-stroked and don't match. If the person picks it, completing full coverage is extra work: composing accents, and drawing all of Cyrillic and `Ð Þ ß æ ø`.
 
 **Coverage:** printable ASCII, Latin-1 letters, Cyrillic U+0400–U+045F, and `· × ↓ → … % +`. A missing character, which only a core name of one's own can bring, is a hollow box.
 
@@ -166,6 +166,8 @@ The still is shown at the person's 34 body rows and also at 24 and 60. If labels
 ### Option (my call; can change before upstream)
 
 A new `userConfig` field, `terminal`: `picture` (default for the person) or `text` (today's view). Upstream is likely better served by `text` as the default.
+
+`/lot-map stats` reports the frame ms (average and p95 over the last 100 frames), the current fps, and blits taken and refused. It is how the frame budget is checked in the real pane, and how a user can report a slow terminal.
 
 ## Build order and early checks
 
