@@ -3,7 +3,7 @@
 import type { StationId } from '../types'
 
 /** Why the terminal pane shows text and not the picture. */
-export type TextReason = 'undrawn' | 'option' | 'inline' | 'small' | 'terminal' | 'bun' | 'images' | 'socket' | 'helper' | 'failed'
+export type TextReason = 'undrawn' | 'option' | 'inline' | 'small' | 'terminal' | 'bun' | 'images' | 'helper' | 'failed'
 
 /** Where the helper that paints the terminal picture stands. */
 export type HelperState = 'idle' | 'starting' | 'running' | 'paused' | 'restarting' | 'stopped' | 'given-up'
@@ -98,8 +98,8 @@ export type Strings = {
   minutes: (m: number, s: number) => string
   /** What `/lot-map stats` answers. */
   stats: (s: PictureStats) => string
-  /** The toast when a request to the helper's socket is refused or fails. */
-  socketRefused: (cause: string) => string
+  /** The toast when the helper failed three times in a minute and the map shows as text for the session. */
+  helperGaveUp: (cause: string) => string
 }
 
 const en: Strings = {
@@ -161,8 +161,7 @@ const en: Strings = {
       terminal: 'this terminal is not Ghostty or kitty, or runs inside tmux, zellij, screen or ssh',
       bun: 'bun was not found',
       images: 'the terminal draws no images here',
-      socket: "the helper's socket refused a request",
-      helper: 'the helper exited three times within a minute',
+      helper: 'the helper failed three times within a minute',
       failed: 'drawing the picture failed',
     },
     frames: (taken, refused) => `frames: ${taken} taken · ${refused} refused`,
@@ -176,7 +175,7 @@ const en: Strings = {
     posts: (sent, coalesced) => `board posts: ${sent} sent · ${coalesced} coalesced`,
     decimal: point,
   }),
-  socketRefused: cause => `The map could not reach its picture helper (${cause}), so it shows as text.`,
+  helperGaveUp: cause => `The map's picture helper failed three times within a minute (${cause}), so the map shows as text.`,
 }
 
 const ru: Strings = {
@@ -238,8 +237,7 @@ const ru: Strings = {
       terminal: 'это не Ghostty и не kitty, или терминал работает внутри tmux, zellij, screen или ssh',
       bun: 'bun не найден',
       images: 'терминал не рисует здесь картинок',
-      socket: 'сокет помощника отказал в запросе',
-      helper: 'помощник завершился три раза за минуту',
+      helper: 'помощник трижды за минуту дал сбой',
       failed: 'картинку не удалось нарисовать',
     },
     frames: (taken, refused) => `кадры: принято ${taken} · отклонено ${refused}`,
@@ -253,7 +251,7 @@ const ru: Strings = {
     posts: (sent, coalesced) => `состояние карты: отправлено ${sent} · объединено ${coalesced}`,
     decimal: point,
   }),
-  socketRefused: cause => `Карта не достучалась до помощника, который рисует картинку (${cause}), и показывается текстом.`,
+  helperGaveUp: cause => `Помощник, который рисует картинку карты, трижды за минуту дал сбой (${cause}), и карта показывается текстом.`,
 }
 
 const es: Strings = {
@@ -315,8 +313,7 @@ const es: Strings = {
       terminal: 'este terminal no es Ghostty ni kitty, o funciona dentro de tmux, zellij, screen o ssh',
       bun: 'no se encontró bun',
       images: 'el terminal no dibuja imágenes aquí',
-      socket: 'el socket del ayudante rechazó una petición',
-      helper: 'el ayudante terminó tres veces en un minuto',
+      helper: 'el ayudante falló tres veces en un minuto',
       failed: 'no se pudo dibujar la imagen',
     },
     frames: (taken, refused) => `fotogramas: ${taken} aceptados · ${refused} rechazados`,
@@ -330,7 +327,7 @@ const es: Strings = {
     posts: (sent, coalesced) => `estados del mapa: ${sent} enviados · ${coalesced} fusionados`,
     decimal: point,
   }),
-  socketRefused: cause => `El mapa no pudo comunicarse con su ayudante de imagen (${cause}); se muestra como texto.`,
+  helperGaveUp: cause => `El ayudante que dibuja la imagen del mapa falló tres veces en un minuto (${cause}); el mapa se muestra como texto.`,
 }
 
 const fr: Strings = {
@@ -392,8 +389,7 @@ const fr: Strings = {
       terminal: "ce terminal n'est ni Ghostty ni kitty, ou il tourne dans tmux, zellij, screen ou ssh",
       bun: 'bun est introuvable',
       images: "le terminal n'affiche pas d'images ici",
-      socket: "le socket de l'auxiliaire a refusé une requête",
-      helper: "l'auxiliaire s'est arrêté trois fois en une minute",
+      helper: "l'auxiliaire a échoué trois fois en une minute",
       failed: "l'image n'a pas pu être dessinée",
     },
     frames: (taken, refused) => `images : ${taken} acceptée${taken > 1 ? 's' : ''} · ${refused} refusée${refused > 1 ? 's' : ''}`,
@@ -407,7 +403,7 @@ const fr: Strings = {
     posts: (sent, coalesced) => `états de la carte : ${sent} envoyé${sent > 1 ? 's' : ''} · ${coalesced} fusionné${coalesced > 1 ? 's' : ''}`,
     decimal: comma,
   }),
-  socketRefused: cause => `La carte n'a pas pu joindre son auxiliaire d'image (${cause}) ; elle s'affiche en texte.`,
+  helperGaveUp: cause => `L'auxiliaire qui dessine l'image de la carte a échoué trois fois en une minute (${cause}) ; la carte s'affiche en texte.`,
 }
 
 const de: Strings = {
@@ -469,8 +465,7 @@ const de: Strings = {
       terminal: 'dieses Terminal ist weder Ghostty noch kitty oder läuft in tmux, zellij, screen oder ssh',
       bun: 'bun wurde nicht gefunden',
       images: 'das Terminal zeigt hier keine Bilder',
-      socket: 'der Socket des Helfers hat eine Anfrage abgelehnt',
-      helper: 'der Helfer wurde dreimal in einer Minute beendet',
+      helper: 'der Helfer ist dreimal in einer Minute ausgefallen',
       failed: 'das Bild ließ sich nicht zeichnen',
     },
     frames: (taken, refused) => `Bilder: ${taken} angenommen · ${refused} abgelehnt`,
@@ -484,7 +479,7 @@ const de: Strings = {
     posts: (sent, coalesced) => `Kartenstände: ${sent} gesendet · ${coalesced} zusammengefasst`,
     decimal: comma,
   }),
-  socketRefused: cause => `Die Karte hat ihren Bildhelfer nicht erreicht (${cause}) und wird als Text gezeigt.`,
+  helperGaveUp: cause => `Der Bildhelfer der Karte ist dreimal in einer Minute ausgefallen (${cause}); die Karte wird als Text gezeigt.`,
 }
 
 const TABLES = new Map<unknown, Strings>([['en', en], ['ru', ru], ['es', es], ['fr', fr], ['de', de]])

@@ -4,8 +4,9 @@
 //   F <name> <width> <height> <generation> after each frame is written
 //   S <frames> <paint ms> <shm ms> <unread> skips=<n> expired=<n>   once a second while frames flow
 //   E <message>                            on an error
-// It never reads stdin (the plugin closes it from the start). It ends on SIGTERM, SIGINT, SIGHUP or SIGPIPE, on an
-// error writing stdout, or when its parent is gone; then it unlinks unread names and removes its socket.
+//   H                                      every second while alive, so the plugin's reading loop always wakes
+// It never reads stdin (the plugin closes it from the start). It ends on POST /quit, on SIGTERM, SIGINT, SIGHUP or
+// SIGPIPE, on an error writing stdout, or when its parent is gone; then it unlinks unread names and removes its socket.
 import { rmdirSync, rmSync, writeSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { LayerCache, paintScene } from '../hooks/paint/scene-paint'
@@ -16,6 +17,7 @@ import { loadShm } from './shm'
 import type { Shm } from './shm'
 
 const ORPHAN_POLL_MS = 2000
+const HEARTBEAT_MS = 1000
 
 const oneLine = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, ' ').trim()
 const note = (text: string): void => {
@@ -87,7 +89,7 @@ const loop = new FrameLoop({
 
 let server: { stop(): void }
 try {
-  server = serve(socketPath, loop)
+  server = serve(socketPath, loop, () => stop('quit'))
 } catch (e) {
   fail(`serve: ${oneLine(e)}`)
 }
@@ -95,12 +97,14 @@ try {
 const orphanPoll = setInterval(() => {
   if (process.ppid === 1) stop('parent gone')
 }, ORPHAN_POLL_MS)
+let heartbeat: ReturnType<typeof setInterval> | undefined
 
 /** Unlinks every name of the ring (what is unread), stops the server, removes the socket and exits. */
 function stop(why: string): void {
   if (stopping) return
   stopping = true
   clearInterval(orphanPoll)
+  clearInterval(heartbeat)
   loop.pause()
   ring.clean()
   try {
@@ -132,3 +136,4 @@ process.on('unhandledRejection', e => {
 process.on('exit', () => ring.clean())
 
 out('R')
+heartbeat = setInterval(() => out('H'), HEARTBEAT_MS)

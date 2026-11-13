@@ -147,3 +147,24 @@ test('/frame while still sends exactly one fresh F line; while paused, none', as
     loop.pause()
   }
 })
+
+test('/quit answers, then quits once; a malformed body gets 400 and quits nothing', async () => {
+  const { path } = socketIn('quit')
+  prepareSocket(path)
+  const { got, loop } = recorder()
+  let quits = 0
+  const server = serve(path, loop, () => quits++)
+  const send = (body?: string) => fetch('http://localhost/quit', { unix: path, method: 'POST', body })
+  try {
+    expect((await send('garbage')).status).toBe(400)
+    await Bun.sleep(20)
+    expect(quits).toBe(0)
+    const answer = await send('{}')
+    expect(answer.status).toBe(200)
+    await Bun.sleep(20)
+    expect(quits).toBe(1)
+    expect(got).toEqual([])
+  } finally {
+    server.stop()
+  }
+})

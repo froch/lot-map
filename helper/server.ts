@@ -94,10 +94,10 @@ const notFound = (): Response => new Response('not found', { status: 404 })
 
 /**
  * Listens on `path` and hands each request to the loop: POST /setup, /board, /pause, /resume, /frame (one fresh
- * frame now, for a remounted Image) and /stats. Anything else answers 404; a malformed body answers 400 and changes
- * nothing.
+ * frame now, for a remounted Image) and /stats. POST /quit answers, then calls `quit`, which cleans up and exits as
+ * SIGTERM does. Anything else answers 404; a malformed body answers 400 and changes nothing.
  */
-export function serve(path: string, loop: FrameLoop): { stop(): void } {
+export function serve(path: string, loop: FrameLoop, quit: () => void = () => {}): { stop(): void } {
   const server = Bun.serve({
     unix: path,
     async fetch(req) {
@@ -123,6 +123,12 @@ export function serve(path: string, loop: FrameLoop): { stop(): void } {
           if (route === '/pause') loop.pause()
           else if (route === '/resume') loop.resume()
           else loop.frame()
+          return ok()
+        }
+        case '/quit': {
+          if (!isNothing(await req.text())) return bad('quit: expected an empty body or {}')
+          // After the answer has gone out: quitting closes the server.
+          setTimeout(quit, 0)
           return ok()
         }
         case '/stats':

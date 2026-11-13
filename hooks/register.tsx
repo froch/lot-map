@@ -39,6 +39,10 @@ const tagRef = atom({ plugin: 'lot-map', key: 'tag' } as const, '')
 const HELPER = 'http://helper'
 /** A render that finds no frame in this long asks for one: a remounted Image draws nothing until a fresh name comes. */
 const STALE_MS = 250
+/** A helper that has not printed R this long after its spawn is taken for hung. */
+const LISTEN_MS = 5000
+/** A helper asked to quit whose loop has not ended this long after is killed. */
+const QUIT_MS = 1000
 /** Blits not yet answered past this many, a frame is let go: the helper unlinks what nobody read. */
 const IN_FLIGHT_MAX = 8
 const BLIT_SAMPLES = 600
@@ -49,6 +53,20 @@ type Facts = { env: Env; bun?: string }
 type ShmSource = { shm: string; format: 'rgba'; width: number; height: number; generation: number }
 type PixelSource = { rgba: string; width: number; height: number }
 
+/** One helper process, from its spawn to the end of its reading loop. A run no longer current does nothing. */
+type Run = {
+  tag: string
+  socket: string
+  /** It printed R. */
+  isListening: boolean
+  /** Its setup and first board are posted: renders feed it from now on. */
+  isFed: boolean
+  /** Its stdout loop has ended, and with it the child. */
+  hasEnded: boolean
+  /** It has counted against the policy, which it does once. */
+  hasFailed: boolean
+}
+
 /** The helper and what the terminal pane last drew, for this load of the module. Never `$`. */
 type Picture = {
   tag?: string
@@ -56,20 +74,15 @@ type Picture = {
   facts?: Promise<Facts>
   /** Why the terminal pane last drew text; undefined while it draws the picture. */
   shown?: Shown
-  /** Text for the rest of the module's life: the socket failed, or the helper exited three times in a minute. */
+  /** Text for the rest of the module's life: the helper failed three times in a minute. */
   blocked?: Shown
   gate: PictureGate
   policy: HelperPolicy
   coalescer: Coalescer<Board>
-  /** Which helper run is current: a loop, a blit or a timer of an older run does nothing. */
-  run: number
+  /** The helper run in force: a loop, a blit, a post or a timer of any other run does nothing. */
+  current?: Run
   helper: HelperState
-  /** The current run printed R and has its setup and board. */
-  ready: boolean
   paused: boolean
-  /** Ends the current run's stdout loop, which kills the helper. */
-  end?: () => void
-  socket: string
   /** The newest frame the Image took: what a redraw draws, the engine never sending it again. */
   lastFrame?: ShmSource
   lastFrameSeq: number
@@ -104,11 +117,8 @@ const freshPicture = (): Picture => ({
   gate: new PictureGate(),
   policy: new HelperPolicy(),
   coalescer: new Coalescer<Board>(),
-  run: 0,
   helper: 'idle',
-  ready: false,
   paused: false,
-  socket: '',
   lastFrameSeq: 0,
   sentSeq: 0,
   inFlight: 0,
@@ -126,28 +136,6 @@ const freshPicture = (): Picture => ({
   sent: 0,
   coalesced: 0,
 })
-
-/** Ends the current run, if any: its loop and timers stop at their next step, and the helper is killed. */
-function stopHelper(pic: Picture, state: HelperState): void {
-  pic.run++
-  pic.ready = false
-  pic.paused = false
-  pic.helper = state
-  const end = pic.end
-  pic.end = undefined
-  end?.()
-}
-
-/**
- * A request to the helper refused or failed: the pane shows text from now on and the helper is stopped. True the
- * first time, when the caller tells the person once.
- */
-function socketFailed(pic: Picture, run: number, cause: string): boolean {
-  if (run !== pic.run || pic.blocked !== undefined) return false
-  pic.blocked = { reason: 'socket', cause }
-  stopHelper(pic, 'stopped')
-  return true
-}
 
 const oneLine = (failure: unknown): string => firstLine(failure instanceof Error ? failure.message : String(failure), 120)
 
@@ -464,17 +452,9 @@ export const register: Register = (on, options) => {
   on('config.set', { key: 'theme' }, async ($, e, next) => {
     const result = await next(e)
     if (result.deny === undefined) {
-      await quietly(async () => {
-        pic.themeRow = String(result.value)
-        const run = pic.run
-        const body = setupBody()
-        if (pic.ready && body !== pic.setupSent) {
-          pic.setupSent = body
-          const cause = await reached('/setup', () => $.http.fetch(`${HELPER}/setup`, { method: 'POST', body, socketPath: pic.socket }))
-          if (cause !== undefined && socketFailed(pic, run, cause)) $.ui.toast(t.socketRefused(cause))
-        }
-        $.ui.invalidate('ui.render')
-      })
+      // The redraw posts the helper its new setup, where a failed post is handled with every other.
+      pic.themeRow = String(result.value)
+      await quietly(async () => $.ui.invalidate('ui.render'))
     }
     return result
   })
@@ -578,28 +558,61 @@ export const register: Register = (on, options) => {
         const env = facts.env
         const rowsAvailable = box.rows
 
-        /** POSTs to the helper; a refusal or a failure gives the text view, the helper stopped and the person told once. */
-        const post = (run: number, path: string, body = '{}'): Promise<unknown> =>
-          quietly(async () => {
-            const cause = await reached(path, () => $.http.fetch(`${HELPER}${path}`, { method: 'POST', body, socketPath: pic.socket }))
-            if (cause !== undefined && socketFailed(pic, run, cause)) {
-              $.ui.invalidate('ui.render')
-              $.ui.toast(t.socketRefused(cause))
-            }
+        /** Ends a run: it is stale at once, then asked to quit, and killed if its loop has not ended a second later. */
+        const stop = (run: Run, state: HelperState): void => {
+          if (pic.current === run) {
+            pic.current = undefined
+            pic.helper = state
+            pic.paused = false
+          }
+          if (run.hasEnded) return
+          void quietly(() => $.http.fetch(`${HELPER}/quit`, { method: 'POST', body: '{}', socketPath: run.socket }))
+          $.clock.after(QUIT_MS, () => {
+            if (!run.hasEnded) void quietly(() => $.process.run(['pkill', '-TERM', '-f', run.socket], { timeoutMs: 5000 }))
           })
-        const postBoard = async (run: number, b: Board, at: number): Promise<void> => {
+        }
+        /**
+         * A run that failed, counted once: it is stopped, then a fresh one starts after 1 s or 5 s; the third failure in
+         * a minute gives the text view for the session, and the person is told once.
+         */
+        const fail = async (run: Run, cause: string): Promise<void> => {
+          if (run.hasFailed || run !== pic.current) return
+          run.hasFailed = true
+          stop(run, 'restarting')
+          const next = pic.policy.exited(await $.clock.now())
+          if ('giveUp' in next) {
+            pic.helper = 'given-up'
+            pic.blocked = { reason: 'helper', cause }
+            $.ui.invalidate('ui.render')
+            $.ui.toast(t.helperGaveUp(cause))
+            return
+          }
+          pic.restarts++
+          $.clock.after(next.restartIn, () => {
+            if (pic.current !== undefined || pic.helper !== 'restarting') return
+            if (pic.blocked === undefined && pic.gate.showsPicture()) start(run.tag)
+            else pic.helper = 'stopped'
+          })
+        }
+        /** POSTs to the helper; a refusal or a failure is the run's failure. */
+        const post = (run: Run, path: string, body = '{}'): Promise<unknown> =>
+          quietly(async () => {
+            const cause = await reached(path, () => $.http.fetch(`${HELPER}${path}`, { method: 'POST', body, socketPath: run.socket }))
+            if (cause !== undefined) await fail(run, cause)
+          })
+        const postBoard = async (run: Run, b: Board, at: number): Promise<void> => {
           pic.sent++
           await post(run, '/board', JSON.stringify({ board: b, now: at, changedAt: changedAt(b) }))
         }
         /** One timer per pending board: when it fires, the newest board offered goes. */
-        const arm = (run: number, coalescer: Coalescer<Board>, at: number): void => {
+        const arm = (run: Run, coalescer: Coalescer<Board>, at: number): void => {
           const wait = coalescer.waitMs(at)
           if (pic.armed === coalescer || wait === undefined) return
           pic.armed = coalescer
           $.clock.after(wait, () => {
             void quietly(async () => {
               if (pic.armed === coalescer) pic.armed = undefined
-              if (run !== pic.run || coalescer !== pic.coalescer) return
+              if (run !== pic.current || coalescer !== pic.coalescer) return
               const due = await $.clock.now()
               const next = coalescer.due(due)
               if (next !== undefined) await postBoard(run, next, due)
@@ -608,7 +621,7 @@ export const register: Register = (on, options) => {
           })
         }
         /** Each frame to the Image, by its name and generation; what the terminal answers goes to the gate. */
-        const relay = (run: number, f: { name: string; width: number; height: number; generation: number }): void => {
+        const relay = (run: Run, f: { name: string; width: number; height: number; generation: number }): void => {
           void quietly(async () => {
             pic.lastFAt = Math.max(pic.lastFAt, await $.clock.now())
           })
@@ -626,7 +639,7 @@ export const register: Register = (on, options) => {
             } finally {
               pic.inFlight--
             }
-            if (run !== pic.run) return
+            if (run !== pic.current) return
             keep(pic.blitMs, performance.now() - sentAt)
             if (answer.deny === undefined) {
               pic.taken++
@@ -641,12 +654,12 @@ export const register: Register = (on, options) => {
             const words = firstLine(answer.deny, 160)
             if (pic.refusals.has(words) || pic.refusals.size < REFUSAL_KINDS) pic.refusals.set(words, (pic.refusals.get(words) ?? 0) + 1)
             const at = await $.clock.now()
-            if (run !== pic.run) return
+            if (run !== pic.current) return
             const next = pic.gate.refused(answer.deny, at)
             if (next.next === 'text') {
-              stopHelper(pic, 'stopped')
+              stop(run, 'stopped')
               $.ui.invalidate('ui.render')
-            } else if (next.next === 'pause' && pic.ready && !pic.paused) {
+            } else if (next.next === 'pause' && run.isFed && !pic.paused) {
               pic.paused = true
               pic.helper = 'paused'
               await post(run, '/pause')
@@ -657,80 +670,75 @@ export const register: Register = (on, options) => {
          * Once the helper listens: its setup, then the board as it stands. Renders feed it only after that, so the
          * first board is this one; a setup that changed meanwhile goes after it.
          */
-        const ready = async (run: number): Promise<void> => {
+        const ready = async (run: Run): Promise<void> => {
+          run.isListening = true
           pic.helper = 'running'
           pic.setupSent = setupBody()
           await post(run, '/setup', pic.setupSent)
           const at = await $.clock.now()
-          if (run !== pic.run) return
+          if (run !== pic.current) return
           pic.askedAt = at // the setup and the board paint a frame of their own
           const first = pic.board
           pic.offered = JSON.stringify(first)
           pic.coalescer.offer(first, at) // a fresh coalescer: the first offer always goes
-          pic.ready = true
+          run.isFed = true
           await postBoard(run, first, at)
           const body = setupBody()
-          if (run === pic.run && body !== pic.setupSent) {
+          if (run === pic.current && body !== pic.setupSent) {
             pic.setupSent = body
             await post(run, '/setup', body)
           }
         }
-        /** Starts a helper and reads it for the session's life; one that ends on its own goes to the policy. */
+        /**
+         * Starts a helper and reads it for the session's life. A loop that ends on its own, an E line, a helper that
+         * prints no R within LISTEN_MS and a failed post are all the run's failure. A stale run leaves its loop at the
+         * next piece, at the latest the helper's H a second later, and leaving the loop kills the child.
+         */
         const start = (tag: string): void => {
-          const run = ++pic.run
+          const run: Run = { tag, socket: socketPath(env, tag), isListening: false, isFed: false, hasEnded: false, hasFailed: false }
+          pic.current = run
           pic.helper = 'starting'
-          pic.ready = false
           pic.paused = false
           pic.lastFrame = undefined
-          pic.socket = socketPath(env, tag)
           pic.coalescer = new Coalescer<Board>()
           pic.offered = ''
           pic.setupSent = ''
           void quietly(async () => {
+            let cause = 'the helper exited'
             try {
-              const child = $.process.spawn({ argv: [bun, `${$.plugin.root}/helper/painter.ts`, pic.socket, tag] })
-              pic.end = () => {
-                void child.return({ code: null, signal: null }).catch(() => undefined)
-              }
+              // Two helpers never share a tag: one that outlived its run is ended first ("no process" is fine).
+              await quietly(() => $.process.run(['pkill', '-TERM', '-f', run.socket], { timeoutMs: 5000 }))
+              if (run !== pic.current) return
+              const child = $.process.spawn({ argv: [bun, `${$.plugin.root}/helper/painter.ts`, run.socket, tag] })
+              $.clock.after(LISTEN_MS, () => {
+                if (run === pic.current && !run.isListening) void fail(run, `no R within ${LISTEN_MS / 1000} s`)
+              })
               const reader = new LineReader()
               reading: for await (const piece of child) {
-                if (run !== pic.run) break
+                if (run !== pic.current) break
                 if (piece.stream !== 'stdout') continue
                 for (const line of reader.push(piece.text)) {
-                  if (run !== pic.run) break reading
+                  if (run !== pic.current) break reading
                   if (line.kind === 'R') await ready(run)
                   else if (line.kind === 'F') relay(run, line)
                   else if (line.kind === 'S') pic.lastS = line.text
                   else {
                     pic.lastE = line.message
+                    cause = `E ${line.message}`
                     break reading
                   }
                 }
               }
-            } catch {
-              // The stream failed or the helper would not start: an exit like any other.
+            } catch (failure) {
+              cause = oneLine(failure)
+            } finally {
+              run.hasEnded = true
             }
-            if (run !== pic.run) return // ended by the plugin
-            pic.end = undefined
-            pic.ready = false
-            pic.paused = false
-            const next = pic.policy.exited(await $.clock.now())
-            if ('giveUp' in next) {
-              pic.blocked = { reason: 'helper' }
-              stopHelper(pic, 'given-up')
-              $.ui.invalidate('ui.render')
-              return
-            }
-            pic.helper = 'restarting'
-            pic.restarts++
-            $.clock.after(next.restartIn, () => {
-              if (run === pic.run && pic.helper === 'restarting' && pic.blocked === undefined && pic.gate.showsPicture()) start(tag)
-            })
+            await fail(run, cause) // nothing for a run the plugin had already ended
           })
         }
         /** What changed since the helper last heard: its setup, the board, a pause to lift, or no recent frame. */
-        const feedHelper = (): void => {
-          const run = pic.run
+        const feedHelper = (run: Run): void => {
           let isSending = false
           const body = setupBody()
           if (body !== pic.setupSent) {
@@ -770,8 +778,9 @@ export const register: Register = (on, options) => {
             pic.themeRow = String(config?.find(row => row.key === 'theme')?.value ?? '')
           }
           const tag = (pic.tag ??= (await quietly(() => read($, tagRef))) || newTag(Math.random))
+          const run = pic.current
           if (pic.helper === 'idle' || pic.helper === 'stopped') start(tag)
-          else if (pic.ready) feedHelper()
+          else if (run?.isFed === true) feedHelper(run)
           return pic.lastFrame ?? placeholder(setup, isLight())
         })
         if (source === undefined) why = { reason: 'failed' }

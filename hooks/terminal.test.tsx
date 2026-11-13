@@ -88,40 +88,59 @@ const PANE = { plugin: 'lot-map', component: 'Pane', requestId: 'lot-map', props
 const GHOSTTY = { TERM_PROGRAM: 'ghostty', TMPDIR: '/var/folders/ab/cdefgh/T/', HOME: '/Users/x' }
 const path = (p: { url: string }) => new URL(p.url).pathname
 
-type Spawn = (feed: (line: string) => void) => AsyncGenerator<{ stream: 'stdout'; text: string }, { value: { code: number | null; signal: string | null } }>
+type Clock = ReturnType<typeof mock.clock>
+type Spawn = (clock: Clock) => AsyncGenerator<{ stream: 'stdout'; text: string }, { value: { code: number | null; signal: string | null } }>
 
-/** A world with a fake helper that prints R, then F lines when told to. */
-const world = (on: On, opts: { env?: Record<string, string>; blit?: (n: number) => { deny?: string }; bun?: boolean; fetchOk?: boolean; spawn?: Spawn; theme?: { value: string } } = {}) => {
+/** A world with a fake helper that prints R, then F lines when told to, and H every second of the mock clock, as the real one does. */
+const world = (
+  on: On,
+  opts: { env?: Record<string, string>; blit?: (n: number) => { deny?: string }; bun?: boolean; fetchOk?: boolean; status?: (path: string, n: number) => number; spawn?: Spawn; theme?: { value: string } } = {},
+) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.env(on, opts.env ?? GHOSTTY)
   const spawned: string[][] = []
+  const spawnedAt: number[] = []
+  const runs: string[][] = []
   const posts: { url: string; body: unknown }[] = []
+  const asked = new Map<string, number>()
   const blits: { name: string; generation: number; at: number }[] = []
+  const toasts: string[] = []
   let stopped = 0
   let feed: (line: string) => void = () => {}
-  const standard: Spawn = async function* (push) {
+  const standard: Spawn = async function* (time) {
     const lines: string[] = ['R\n']
     let wake: (() => void) | undefined
-    feed = line => { lines.push(line); wake?.() }
+    let isAlive = true
+    const push = (line: string) => { lines.push(line); wake?.() }
+    feed = push
+    void (async () => { while (isAlive) { await time.sleep(1000); if (isAlive) push('H\n') } })()
     try {
       while (true) {
         while (lines.length > 0) yield { stream: 'stdout', text: lines.shift()! }
         await new Promise<void>(r => { wake = r })
       }
-    } finally { stopped++ }
+    } finally { isAlive = false; stopped++ }
   }
-  on('process.run', () => (opts.bun === false ? { deny: 'not found' } : { value: { exitCode: 0, stdout: '1.4.4\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', (_, e) => {
+    runs.push([...e.argv])
+    if (e.argv[0] === 'pkill') return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return opts.bun === false ? { deny: 'not found' } : { value: { exitCode: 0, stdout: '1.4.4\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
   on('fs.exists', () => ({ value: opts.bun !== false }))
-  on('process.spawn', async function* (_, e) { spawned.push([...e.argv]); return yield* (opts.spawn ?? standard)(line => feed(line)) })
+  on('process.spawn', async function* (_, e) { spawned.push([...e.argv]); spawnedAt.push(clock.now()); return yield* (opts.spawn ?? standard)(clock) })
   on('http.fetch', (_, e) => {
     posts.push({ url: e.url, body: JSON.parse(String(e.init?.body ?? 'null')) })
-    return opts.fetchOk === false ? { deny: 'refused by policy' } : { value: { status: 200, ok: true, headers: {}, text: '{}' } }
+    const route = path(e)
+    asked.set(route, (asked.get(route) ?? 0) + 1)
+    const status = opts.status?.(route, asked.get(route)!) ?? 200
+    return opts.fetchOk === false ? { deny: 'refused by policy' } : { value: { status, ok: status < 400, headers: {}, text: status < 400 ? '{}' : 'helper trouble' } }
   })
+  on('ui.toast', (_, e) => { toasts.push(e.text); return { value: undefined } })
   on('ui.blit', (_, e) => { const s = ('source' in e ? e.source : {}) as { shm: string; generation: number }; blits.push({ name: s.shm, generation: s.generation, at: clock.now() }); return { value: opts.blit?.(blits.length) ?? {} } })
   on('config.list', () => ({ value: opts.theme === undefined ? [] : [{ key: 'theme', label: 'Theme', kind: 'choice', value: opts.theme.value, provider: { plugin: 'engine', tier: 'core' }, isLocked: false }] }))
   on('config.set', (_, e) => { if (opts.theme !== undefined) opts.theme.value = String(e.value); return { value: e.value } })
   on('tool.call', () => ({ result: {} }))
-  return { clock, spawned, posts, blits, stopped: () => stopped, frame: (k: number) => feed(`F /lm-abcd1234-${k % 8} 727 680 ${k + 1}\n`) }
+  return { clock, spawned, spawnedAt, runs, posts, blits, toasts, stopped: () => stopped, frame: (k: number) => feed(`F /lm-abcd1234-${k % 8} 727 680 ${k + 1}\n`) }
 }
 
 test('in Ghostty the pane starts one helper, posts setup and board, and relays frames with their generation', SLOW, async ($, on) => {
@@ -196,8 +215,7 @@ test('two alt refusals two seconds apart stop the helper and show text by themse
   w.frame(1)
   await w.clock.settle()
   expect(await ui.find({ type: 'Image' })).toBeUndefined()
-  w.frame(2) // wakes the fake helper so its loop can see it was ended
-  await w.clock.settle()
+  await w.clock.advance(1000) // the helper's next H: its loop sees the run has ended
   expect(w.stopped()).toBe(1)
 })
 
@@ -225,21 +243,24 @@ test('board posts are coalesced to at most ten a second and the newest board arr
 
 test('a helper that exits three times within a minute leaves the text view, and an E line counts as a failure', SLOW, async ($, on) => {
   let starts = 0
-  const w = world(on, { spawn: async function* () { starts++; yield { stream: 'stdout', text: starts === 1 ? 'E no cc\n' : 'S x\n' }; return { value: { code: 2, signal: null } } } })
+  const w = world(on, { spawn: async function* () { starts++; yield { stream: 'stdout' as const, text: starts === 1 ? 'E no cc\n' : 'S x\n' }; return { value: { code: 2, signal: null } } } })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await w.clock.advance(10_000)
   expect(starts).toBe(3)
   expect(await ui.find({ type: 'Image' })).toBeUndefined()
 })
 
-test('a refused socket request gives the text view', SLOW, async ($, on) => {
+test('a refused socket request is a helper failure: three within a minute give the text view and one toast', SLOW, async ($, on) => {
   const w = world(on, { fetchOk: false })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeDefined() // one failure: a fresh helper comes in a second
+  await w.clock.advance(10_000)
+  expect(w.spawned.length).toBe(3)
   expect(await ui.find({ type: 'Image' })).toBeUndefined()
-  w.frame(0) // wakes the fake helper so its loop can see it was ended
-  await w.clock.settle()
-  expect(w.stopped()).toBe(1)
+  expect(w.toasts.length).toBe(1)
+  expect(w.toasts[0]).toContain('/setup')
+  expect(w.stopped()).toBe(3)
 })
 
 test('with Claude Code on a light theme and the map on auto, setup says light; a theme change posts setup again', SLOW, async ($, on) => {
@@ -316,4 +337,53 @@ test('a tag kept from before a reload names the next helper', SLOW, async ($, on
   await $.ui.mount({ ...PANE, surface: 'terminal' })
   await w.clock.settle()
   expect(w.spawned[0]!.slice(-2)).toEqual(['/var/folders/ab/cdefgh/T/lot-map-kept0tag/h.sock', 'kept0tag'])
+})
+
+test('a /board answered 500 stops the run, asks it to quit, and starts a fresh helper a second later', SLOW, async ($, on) => {
+  const w = world(on, { status: (route, n) => (route === '/board' && n === 1 ? 500 : 200) })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  const socket = w.spawned[0]!.at(-2)!
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/quit'])
+  await w.clock.advance(1000)
+  expect(w.spawnedAt).toEqual([1_000_000, 1_001_000])
+  expect(w.stopped()).toBe(1)
+  expect(w.runs.filter(argv => argv[0] === 'pkill')).toContainEqual(['pkill', '-TERM', '-f', socket])
+  expect(w.runs.filter(argv => argv[0] === 'pkill').length).toBe(2) // before each spawn; the first run had ended, so no backstop
+  expect(w.posts.map(path).slice(3)).toEqual(['/setup', '/board'])
+})
+
+test('a helper that never prints R is stopped after 5 s, killed a second later, and a fresh one started', SLOW, async ($, on) => {
+  const w = world(on, { spawn: async function* (time) { await time.sleep(600_000); return { value: { code: 0, signal: null } } } })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.advance(4999)
+  expect(w.spawned.length).toBe(1)
+  expect(w.posts).toEqual([])
+  await w.clock.advance(1)
+  expect(w.posts.map(path)).toEqual(['/quit'])
+  await w.clock.advance(1000)
+  expect(w.spawned.length).toBe(2)
+  expect(w.spawnedAt).toEqual([1_000_000, 1_006_000])
+  expect(w.runs.filter(argv => argv[0] === 'pkill').length).toBe(3) // before each spawn, and the backstop for the silent one
+})
+
+test('a still map switched to text by the gate ends its helper by the next H, and a reopen a minute later leaves one helper alive', SLOW, async ($, on) => {
+  const w = world(on, { blit: () => ({ deny: 'the Image draws its alt here: no images' }) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.advance(2100)
+  w.frame(1)
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(w.posts.map(path).at(-1)).toBe('/quit')
+  await w.clock.advance(1000)
+  expect(w.stopped()).toBe(1)
+  await w.clock.advance(60_000)
+  await $.tool.call({ tool: 'Read', file_path: '/a/b.ts' })
+  await w.clock.settle()
+  expect(await ui.find({ type: 'Image' })).toBeDefined()
+  expect(w.spawned.length).toBe(2)
+  expect(w.spawned.length - w.stopped()).toBe(1)
+  expect(w.runs.filter(argv => argv[0] === 'pkill').length).toBe(2)
 })
