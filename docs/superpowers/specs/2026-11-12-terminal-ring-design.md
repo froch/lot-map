@@ -120,7 +120,8 @@ From the API types (2.1.322; Claude Code has since updated to 2.1.323), the engi
 ### Caching per station, so events don't stutter (new)
 
 - **What the painter caches.** It caches the unchanging parts as separate layers, each with its own key:
-  - the background (ground, contours, spokes);
+  - the background (ground and contours), which changes only with the theme, the background option or the size;
+  - each station's spoke (its width follows the station's count);
   - each station's resting layer (node disc, icon, name, count, badges);
   - the core's resting layer (disc, name, model, percentage).
 - **What a board change repaints.** Only layers whose key changed. A key is the strings of the nodes in that layer, so it changes exactly when the drawing would.
@@ -164,13 +165,14 @@ From the API types (2.1.322; Claude Code has since updated to 2.1.323), the engi
   The socket carries only these messages; no frame data passes through it or the disk.
 - **Channel out: stdout lines.**
   - `R` once, when the socket listens;
-  - `F <name> <width> <height>` for each frame;
+  - `F <name> <width> <height> <generation>` for each frame. The generation, a running frame counter, is the ImageSource field that marks a reused name as a fresh object;
   - `S …` each second, with frames, paint ms, shm ms, unread count and skips;
   - `E <message>` for an error.
 - **Frames.** A ring of 8 fixed names per session, `/lm-<session tag>-<k>` with the tag 8 characters (at most 30 in all). The tag is made once per session and kept in `$.state`, so it survives a plugin reload, and a restarted helper cleans its predecessor's ring.
   - **Creating:** a frame goes to the next name whose object is gone (the terminal unlinked it), via `O_EXCL`.
   - **Backpressure:** if all 8 are unread, the tick is skipped.
-  - **Clean-up:** at start the helper unlinks all 8 names, so a crashed predecessor in the same session leaves nothing; at exit and on SIGTERM or SIGINT it unlinks what is unread; it also unlinks any of its frames still unread after 1 s.
+  - **Clean-up:** at start the helper unlinks all 8 names, so a crashed predecessor in the same session leaves nothing; at exit it unlinks what is unread; it also unlinks any of its frames still unread after 1 s.
+  - **Parent death:** the helper never watches stdin, which `$.process.spawn` closes from the start. It exits on SIGTERM, SIGINT, SIGHUP or SIGPIPE, on an error writing stdout, or when a 2 s poll finds its parent gone (`process.ppid === 1`).
   - The C shim compiles at start with `bun:ffi` `cc`. If that fails, the helper prints `E` and exits, and the pane shows text.
 - **The loop.**
   - Clocks (my call): the plugin and the helper share the machine's wall clock (`$.clock.now()` and `Date.now()`). The helper builds the scene with the posted `now` and samples it at `Date.now()`. Only when the two differ by more than 1 s (a test's mock clock) does it use the offset from the latest post, fixed per post, so a re-post with the same entries never makes a pulse jump.
@@ -199,7 +201,7 @@ From the API types (2.1.322; Claude Code has since updated to 2.1.323), the engi
   - `$.http.fetch` over the socket reaches the bun server. If not, the pane shows text and the person is told.
   - A helper started from a render hook's closure survives the hook. If not, it is started from `session.start`'s closure, as the API's own example does.
   - Frames of a new pixel size after the 1×1 placeholder draw. If not, the placeholder is full size.
-- **Relaying.** Each `F <name> <width> <height>` becomes `$.ui.blit({ requestId: 'lot-map', key: 'map', source: { shm: name, format: 'rgba', width, height } })`, then:
+- **Relaying.** Each `F <name> <width> <height> <generation>` becomes `$.ui.blit({ requestId: 'lot-map', key: 'map', source: { shm: name, format: 'rgba', width, height, generation } })`, then:
   - **accepted:** pictures work;
   - **the start-up capability message:** retry the next frame;
   - **alt** (`the Image draws its alt here:`), twice at least 2 s apart with nothing accepted: text view, and the helper is stopped. A render 60 s later tries again.

@@ -130,7 +130,7 @@ test('the desktop drawing is unchanged, case by case', () => {
 })
 ```
 
-- [ ] **Step 3: Capture on the unchanged code.** Run `bun scripts/golden.ts write && claude plugin test .`. Expected: all pass, and `scripts/golden-out/` holds 68 `.svg` files.
+- [ ] **Step 3: Capture on the unchanged code.** Run `bun scripts/golden.ts write && claude plugin test .`. Expected: all pass, and `scripts/golden-out/` holds 68 `.svg` files. If `bun scripts/golden.ts check` passes but the plugin test fails, the two runtimes format numbers differently. In that case, generate `golden-hashes.ts` from inside `claude plugin test`, with a one-off test that prints the fingerprints, and say so in the report.
 - [ ] **Step 4: Prove the guard bites.** Temporarily change the core's `stroke-width="1.3"` to `1.31` in `drawMap`. Run `bun scripts/golden.ts check`: expected, non-zero mismatches with offsets. Run `claude plugin test .`: expected, the golden test fails. Revert the change.
 - [ ] **Step 5: Commit:** `git add .gitignore hooks/golden-cases.ts hooks/golden-hashes.ts hooks/golden.test.ts scripts/golden.ts && git commit -m "Capture the desktop drawing to guard the refactor"`
 
