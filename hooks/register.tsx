@@ -7,7 +7,7 @@ import type { Setup } from './map'
 import { boardBody, setupBody } from './helper-bodies'
 import { DARK, LIGHT, lightPairs } from './palette'
 import { drawMap } from './svg'
-import { Coalescer, HelperPolicy, LineReader, PictureGate, newTag, ringBox, socketPath, terminalAllows } from './terminal'
+import { Coalescer, HelperPolicy, LineReader, PictureGate, isNotMounted, newTag, ringBox, socketPath, terminalAllows } from './terminal'
 import type { Env } from './terminal'
 import type { HelperState, PictureStats, TextReason } from './text'
 
@@ -45,6 +45,12 @@ const LISTEN_MS = 5000
 const QUIT_MS = 1000
 /** Blits not yet answered past this many, a frame is let go: the helper unlinks what nobody read. */
 const IN_FLIGHT_MAX = 8
+/** A frame the Image did not take, still the newest this long after, is asked for again with /frame. */
+const RETRY_MS = 150
+/** At most this many times in a row: a taken frame starts the count again. */
+const RETRIES_MAX = 5
+/** A not-mounted refusal this soon after a render asked for a frame means the Image is not mounted yet. */
+const MOUNT_MS = 500
 const BLIT_SAMPLES = 600
 const REFUSAL_KINDS = 8
 
@@ -65,6 +71,8 @@ type Run = {
   hasEnded: boolean
   /** It has counted against the policy, which it does once. */
   hasFailed: boolean
+  /** The frame (by its seq) a pending timer will ask again for, if it is still the newest and not taken. */
+  asking?: number
 }
 
 /** The helper and what the terminal pane last drew, for this load of the module. Never `$`. */
@@ -85,12 +93,18 @@ type Picture = {
   paused: boolean
   /** The newest frame the Image took: what a redraw draws, the engine never sending it again. */
   lastFrame?: ShmSource
+  /** F lines are numbered as they come: the newest taken, the newest relayed, the newest known not taken. */
   lastFrameSeq: number
   sentSeq: number
+  missedSeq: number
+  /** /frame posts in a row asking again for a frame not taken. */
+  retries: number
   inFlight: number
   /** When the last F line came, and when a frame was last asked for (R, /frame), by the engine's clock. */
   lastFAt: number
   askedAt: number
+  /** When a render last posted the helper something that paints a frame. */
+  renderAskedAt: number
   /** Claude Code's `theme` row, read on the first render and on each change. */
   themeRow?: string
   /** The ring box's rows and the board the pane last drew. */
@@ -103,6 +117,8 @@ type Picture = {
   armed?: Coalescer<Board>
   taken: number
   refused: number
+  dropped: number
+  retried: number
   refusals: Map<string, number>
   blitMs: number[]
   lastS?: string
@@ -121,15 +137,20 @@ const freshPicture = (): Picture => ({
   paused: false,
   lastFrameSeq: 0,
   sentSeq: 0,
+  missedSeq: 0,
+  retries: 0,
   inFlight: 0,
   lastFAt: -Infinity,
   askedAt: -Infinity,
+  renderAskedAt: -Infinity,
   rows: 0,
   board: { entries: [], counts: {} },
   offered: '',
   setupSent: '',
   taken: 0,
   refused: 0,
+  dropped: 0,
+  retried: 0,
   refusals: new Map(),
   blitMs: [],
   restarts: 0,
@@ -160,6 +181,8 @@ function statsOf(pic: Picture): PictureStats {
     ...(pic.shown === undefined ? {} : { text: pic.shown }),
     taken: pic.taken,
     refused: pic.refused,
+    dropped: pic.dropped,
+    retries: pic.retried,
     refusals: [...pic.refusals],
     helper: pic.helper,
     restarts: pic.restarts,
@@ -620,14 +643,45 @@ export const register: Register = (on, options) => {
             })
           })
         }
+        /**
+         * While the newest frame is one the Image did not take, asks the helper for another RETRY_MS later if no newer
+         * frame came meanwhile (a moving map sends its own), at most RETRIES_MAX times in a row: a lasting refusal
+         * never keeps a still map painting. A still map paints one frame, so without this a lost one stays lost.
+         */
+        const askAgain = (run: Run): void => {
+          const seq = pic.sentSeq
+          if (run.asking === seq || pic.paused || pic.retries >= RETRIES_MAX || pic.missedSeq !== seq) return
+          run.asking = seq
+          try {
+            $.clock.after(RETRY_MS, () => {
+              if (run.asking === seq) run.asking = undefined
+              if (run !== pic.current || pic.sentSeq !== seq || pic.missedSeq !== seq) return
+              if (pic.paused || pic.retries >= RETRIES_MAX) return
+              pic.retries++
+              pic.retried++
+              void post(run, '/frame')
+            })
+          } catch {
+            run.asking = undefined // no timer: the next render asks for a frame if none came
+          }
+        }
+        /** Frame `seq` was not taken: if it is the newest, the helper is asked for another. */
+        const missed = (run: Run, seq: number): void => {
+          pic.missedSeq = Math.max(pic.missedSeq, seq)
+          askAgain(run)
+        }
         /** Each frame to the Image, by its name and generation; what the terminal answers goes to the gate. */
         const relay = (run: Run, f: { name: string; width: number; height: number; generation: number }): void => {
           void quietly(async () => {
             pic.lastFAt = Math.max(pic.lastFAt, await $.clock.now())
           })
-          if (pic.inFlight >= IN_FLIGHT_MAX) return
-          const frame: ShmSource = { shm: f.name, format: 'rgba', width: f.width, height: f.height, generation: f.generation }
           const seq = ++pic.sentSeq
+          if (pic.inFlight >= IN_FLIGHT_MAX) {
+            pic.dropped++
+            missed(run, seq)
+            return
+          }
+          const frame: ShmSource = { shm: f.name, format: 'rgba', width: f.width, height: f.height, generation: f.generation }
           pic.inFlight++
           const sentAt = performance.now()
           void quietly(async () => {
@@ -643,11 +697,13 @@ export const register: Register = (on, options) => {
             keep(pic.blitMs, performance.now() - sentAt)
             if (answer.deny === undefined) {
               pic.taken++
+              pic.retries = 0
               pic.gate.accepted(now) // the gate keeps no time for a taken frame
               if (seq > pic.lastFrameSeq) {
                 pic.lastFrameSeq = seq
                 pic.lastFrame = frame
               }
+              askAgain(run) // an older frame taken while the newest was not: that one is still owed
               return
             }
             pic.refused++
@@ -656,13 +712,20 @@ export const register: Register = (on, options) => {
             const at = await $.clock.now()
             if (run !== pic.current) return
             const next = pic.gate.refused(answer.deny, at)
+            // A render's ask can beat the Image's mount: not mounted that soon after is asked again, not paused.
+            const isMounting = isNotMounted(answer.deny) && at - pic.renderAskedAt <= MOUNT_MS
             if (next.next === 'text') {
               stop(run, 'stopped')
               $.ui.invalidate('ui.render')
-            } else if (next.next === 'pause' && run.isFed && !pic.paused) {
-              pic.paused = true
-              pic.helper = 'paused'
-              await post(run, '/pause')
+            } else if (next.next === 'pause' && !isMounting) {
+              pic.missedSeq = Math.max(pic.missedSeq, seq)
+              if (run.isFed && !pic.paused) {
+                pic.paused = true
+                pic.helper = 'paused'
+                await post(run, '/pause')
+              }
+            } else {
+              missed(run, seq)
             }
           })
         }
@@ -700,6 +763,7 @@ export const register: Register = (on, options) => {
           pic.helper = 'starting'
           pic.paused = false
           pic.lastFrame = undefined
+          pic.retries = 0
           pic.coalescer = new Coalescer<Board>()
           pic.offered = ''
           pic.setupSent = ''
@@ -763,11 +827,15 @@ export const register: Register = (on, options) => {
           if (pic.paused) {
             pic.paused = false
             pic.helper = 'running'
+            isSending = true
             void post(run, '/resume')
           } else if (!isSending && now - Math.max(pic.lastFAt, pic.askedAt) >= STALE_MS) {
             pic.askedAt = now
+            isSending = true
             void post(run, '/frame')
           }
+          // The frame this asks for may come before the Image this render returns is mounted.
+          if (isSending) pic.renderAskedAt = now
         }
 
         source = await quietly(async () => {

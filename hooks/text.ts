@@ -14,6 +14,10 @@ export type PictureStats = {
   text?: { reason: TextReason; cause?: string }
   taken: number
   refused: number
+  /** Frames let go with too many blits unanswered. */
+  dropped: number
+  /** Times the helper was asked again for a frame because the newest was not taken. */
+  retries: number
   /** The words of each refusal, with how many times it came. */
   refusals: readonly (readonly [string, number])[]
   helper: HelperState
@@ -31,7 +35,7 @@ type StatsWords = {
   picture: string
   text: (why: string) => string
   reasons: Record<TextReason, string>
-  frames: (taken: number, refused: number) => string
+  frames: (taken: number, refused: number, dropped: number, retries: number) => string
   helper: (state: string, restarts: number) => string
   states: Record<HelperState, string>
   blit: (average: string, p95: string) => string
@@ -48,7 +52,7 @@ const statsIn =
   (s: PictureStats): string =>
     [
       w.mode(s.text === undefined ? w.picture : w.text(`${w.reasons[s.text.reason]}${s.text.cause ? `: ${s.text.cause}` : ''}`)),
-      w.frames(s.taken, s.refused),
+      w.frames(s.taken, s.refused, s.dropped, s.retries),
       ...s.refusals.map(([words, n]) => `  ${n} × ${words}`),
       w.helper(w.states[s.helper], s.restarts),
       s.blitMs === undefined ? w.noBlits : w.blit(w.decimal(s.blitMs.average), w.decimal(s.blitMs.p95)),
@@ -164,7 +168,7 @@ const en: Strings = {
       helper: 'the helper failed three times within a minute',
       failed: 'drawing the picture failed',
     },
-    frames: (taken, refused) => `frames: ${taken} taken · ${refused} refused`,
+    frames: (taken, refused, dropped, retries) => `frames: ${taken} taken · ${refused} refused · ${dropped} dropped · ${retries} asked again`,
     helper: (state, restarts) => `helper: ${state} · ${restarts} restart${restarts === 1 ? '' : 's'}`,
     states: { idle: 'not started', starting: 'starting', running: 'running', paused: 'paused', restarting: 'restarting', stopped: 'stopped', 'given-up': 'given up' },
     blit: (average, p95) => `blit: ${average} ms on average · ${p95} ms p95`,
@@ -240,7 +244,7 @@ const ru: Strings = {
       helper: 'помощник трижды за минуту дал сбой',
       failed: 'картинку не удалось нарисовать',
     },
-    frames: (taken, refused) => `кадры: принято ${taken} · отклонено ${refused}`,
+    frames: (taken, refused, dropped, retries) => `кадры: принято ${taken} · отклонено ${refused} · пропущено ${dropped} · запрошено снова ${retries}`,
     helper: (state, restarts) => `помощник: ${state} · перезапусков ${restarts}`,
     states: { idle: 'не запущен', starting: 'запускается', running: 'работает', paused: 'на паузе', restarting: 'перезапускается', stopped: 'остановлен', 'given-up': 'больше не запускается' },
     blit: (average, p95) => `вывод кадра: в среднем ${average} мс · p95 ${p95} мс`,
@@ -316,7 +320,7 @@ const es: Strings = {
       helper: 'el ayudante falló tres veces en un minuto',
       failed: 'no se pudo dibujar la imagen',
     },
-    frames: (taken, refused) => `fotogramas: ${taken} aceptados · ${refused} rechazados`,
+    frames: (taken, refused, dropped, retries) => `fotogramas: ${taken} aceptados · ${refused} rechazados · ${dropped} descartados · ${retries} pedidos de nuevo`,
     helper: (state, restarts) => `ayudante: ${state} · ${restarts} reinicio${restarts === 1 ? '' : 's'}`,
     states: { idle: 'sin iniciar', starting: 'iniciándose', running: 'en marcha', paused: 'en pausa', restarting: 'reiniciándose', stopped: 'detenido', 'given-up': 'abandonado' },
     blit: (average, p95) => `envío de fotograma: ${average} ms de media · p95 ${p95} ms`,
@@ -392,7 +396,8 @@ const fr: Strings = {
       helper: "l'auxiliaire a échoué trois fois en une minute",
       failed: "l'image n'a pas pu être dessinée",
     },
-    frames: (taken, refused) => `images : ${taken} acceptée${taken > 1 ? 's' : ''} · ${refused} refusée${refused > 1 ? 's' : ''}`,
+    frames: (taken, refused, dropped, retries) =>
+      `images : ${taken} acceptée${taken > 1 ? 's' : ''} · ${refused} refusée${refused > 1 ? 's' : ''} · ${dropped} abandonnée${dropped > 1 ? 's' : ''} · ${retries} redemandée${retries > 1 ? 's' : ''}`,
     helper: (state, restarts) => `auxiliaire : ${state} · ${restarts} redémarrage${restarts > 1 ? 's' : ''}`,
     states: { idle: 'pas démarré', starting: 'en démarrage', running: 'en marche', paused: 'en pause', restarting: 'en redémarrage', stopped: 'arrêté', 'given-up': 'abandonné' },
     blit: (average, p95) => `envoi d'image : ${average} ms en moyenne · p95 ${p95} ms`,
@@ -468,7 +473,7 @@ const de: Strings = {
       helper: 'der Helfer ist dreimal in einer Minute ausgefallen',
       failed: 'das Bild ließ sich nicht zeichnen',
     },
-    frames: (taken, refused) => `Bilder: ${taken} angenommen · ${refused} abgelehnt`,
+    frames: (taken, refused, dropped, retries) => `Bilder: ${taken} angenommen · ${refused} abgelehnt · ${dropped} verworfen · ${retries} neu angefordert`,
     helper: (state, restarts) => `Helfer: ${state} · ${restarts} Neustart${restarts === 1 ? '' : 's'}`,
     states: { idle: 'nicht gestartet', starting: 'startet', running: 'läuft', paused: 'pausiert', restarting: 'startet neu', stopped: 'gestoppt', 'given-up': 'aufgegeben' },
     blit: (average, p95) => `Bildübergabe: ${average} ms im Mittel · p95 ${p95} ms`,

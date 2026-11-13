@@ -48,6 +48,9 @@ export type Refusal = { next: 'text' } | { next: 'pause' } | { next: 'carry-on' 
 const ALT_PREFIX = 'the Image draws its alt here:'
 const NOT_MOUNTED_PREFIX = 'no Image of its own is mounted'
 
+/** The Image the frame was for is not mounted: hidden, closed, or not mounted yet. */
+export const isNotMounted = (deny: string): boolean => deny.startsWith(NOT_MOUNTED_PREFIX)
+
 export class PictureGate {
   private takenOne = false
   private firstAlt: number | undefined
@@ -59,9 +62,8 @@ export class PictureGate {
 
   refused(deny: string, now: number): Refusal {
     const alt = deny.startsWith(ALT_PREFIX)
-    if (this.takenOne) {
-      return alt || deny.startsWith(NOT_MOUNTED_PREFIX) ? { next: 'pause' } : { next: 'carry-on' }
-    }
+    if (isNotMounted(deny)) return { next: 'pause' }
+    if (this.takenOne) return alt ? { next: 'pause' } : { next: 'carry-on' }
     if (!alt) return { next: 'carry-on' }
     if (this.firstAlt === undefined) {
       this.firstAlt = now

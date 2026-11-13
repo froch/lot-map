@@ -3,6 +3,8 @@ import type { On } from 'claude-code'
 import { Coalescer, HelperPolicy, LineReader, PictureGate, newTag, ringBox, socketPath, terminalAllows } from './terminal'
 
 const ALT = 'the Image draws its alt here: this terminal draws no images'
+const NOT_MOUNTED = 'no Image of its own is mounted under key map'
+const STARTING = 'the terminal has not yet said whether it reads files on this machine; asked now, blit again'
 
 test('the ring box follows the pane and gives way to text below twelve rows', () => {
   expect(ringBox(34, 89)).toEqual({ columns: 45, rows: 20 })
@@ -45,9 +47,18 @@ test('after a taken frame, alt and not-mounted refusals pause; the start-up mess
   const g = new PictureGate()
   g.accepted(0)
   expect(g.refused(ALT, 10)).toEqual({ next: 'pause' })
-  expect(g.refused('no Image of its own is mounted under key map', 20)).toEqual({ next: 'pause' })
-  expect(g.refused('the terminal has not yet said whether it reads files on this machine; asked now, blit again', 30)).toEqual({ next: 'carry-on' })
+  expect(g.refused(NOT_MOUNTED, 20)).toEqual({ next: 'pause' })
+  expect(g.refused(STARTING, 30)).toEqual({ next: 'carry-on' })
   expect(g.refused('too many blits this second', 40)).toEqual({ next: 'carry-on' })
+  expect(g.showsPicture()).toBe(true)
+})
+
+test('before any taken frame, a not-mounted refusal pauses too; the start-up message and others carry on', () => {
+  const g = new PictureGate()
+  expect(g.refused(NOT_MOUNTED, 10)).toEqual({ next: 'pause' })
+  expect(g.refused(STARTING, 20)).toEqual({ next: 'carry-on' })
+  expect(g.refused('too many blits this second', 30)).toEqual({ next: 'carry-on' })
+  expect(g.refused(NOT_MOUNTED, 40)).toEqual({ next: 'pause' })
   expect(g.showsPicture()).toBe(true)
 })
 
@@ -91,10 +102,25 @@ const path = (p: { url: string }) => new URL(p.url).pathname
 type Clock = ReturnType<typeof mock.clock>
 type Spawn = (clock: Clock) => AsyncGenerator<{ stream: 'stdout'; text: string }, { value: { code: number | null; signal: string | null } }>
 
-/** A world with a fake helper that prints R, then F lines when told to, and H every second of the mock clock, as the real one does. */
+/**
+ * A world with a fake helper that prints R, then F lines when told to (and, with `paints`, one for each /frame or
+ * /resume), and H every second of the mock clock, as the real one does; a `silent` one prints no H.
+ * `late` holds the n-th blit's answer that many ms.
+ */
 const world = (
   on: On,
-  opts: { env?: Record<string, string>; blit?: (n: number) => { deny?: string }; bun?: boolean; fetchOk?: boolean; status?: (path: string, n: number) => number; spawn?: Spawn; theme?: { value: string } } = {},
+  opts: {
+    env?: Record<string, string>
+    blit?: (n: number) => { deny?: string }
+    late?: (n: number) => number
+    paints?: boolean
+    silent?: boolean
+    bun?: boolean
+    fetchOk?: boolean
+    status?: (path: string, n: number) => number
+    spawn?: Spawn
+    theme?: { value: string }
+  } = {},
 ) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.env(on, opts.env ?? GHOSTTY)
@@ -106,14 +132,19 @@ const world = (
   const blits: { name: string; generation: number; at: number }[] = []
   const toasts: string[] = []
   let stopped = 0
+  let painted = 0
   let feed: (line: string) => void = () => {}
+  const frame = (k: number) => {
+    painted = Math.max(painted, k + 1)
+    feed(`F /lm-abcd1234-${k % 8} 727 680 ${k + 1}\n`)
+  }
   const standard: Spawn = async function* (time) {
     const lines: string[] = ['R\n']
     let wake: (() => void) | undefined
     let isAlive = true
     const push = (line: string) => { lines.push(line); wake?.() }
     feed = push
-    void (async () => { while (isAlive) { await time.sleep(1000); if (isAlive) push('H\n') } })()
+    if (!opts.silent) void (async () => { while (isAlive) { await time.sleep(1000); if (isAlive) push('H\n') } })()
     try {
       while (true) {
         while (lines.length > 0) yield { stream: 'stdout', text: lines.shift()! }
@@ -133,15 +164,25 @@ const world = (
     const route = path(e)
     asked.set(route, (asked.get(route) ?? 0) + 1)
     const status = opts.status?.(route, asked.get(route)!) ?? 200
+    if (opts.paints && status < 400 && (route === '/frame' || route === '/resume')) frame(painted)
     return opts.fetchOk === false ? { deny: 'refused by policy' } : { value: { status, ok: status < 400, headers: {}, text: status < 400 ? '{}' : 'helper trouble' } }
   })
   on('ui.toast', (_, e) => { toasts.push(e.text); return { value: undefined } })
-  on('ui.blit', (_, e) => { const s = ('source' in e ? e.source : {}) as { shm: string; generation: number }; blits.push({ name: s.shm, generation: s.generation, at: clock.now() }); return { value: opts.blit?.(blits.length) ?? {} } })
+  on('ui.blit', async (_, e) => {
+    const s = ('source' in e ? e.source : {}) as { shm: string; generation: number }
+    blits.push({ name: s.shm, generation: s.generation, at: clock.now() })
+    const n = blits.length
+    const wait = opts.late?.(n) ?? 0
+    if (wait > 0) await clock.sleep(wait)
+    return { value: opts.blit?.(n) ?? {} }
+  })
   on('config.list', () => ({ value: opts.theme === undefined ? [] : [{ key: 'theme', label: 'Theme', kind: 'choice', value: opts.theme.value, provider: { plugin: 'engine', tier: 'core' }, isLocked: false }] }))
   on('config.set', (_, e) => { if (opts.theme !== undefined) opts.theme.value = String(e.value); return { value: e.value } })
   on('tool.call', () => ({ result: {} }))
-  return { clock, spawned, spawnedAt, runs, posts, blits, toasts, stopped: () => stopped, frame: (k: number) => feed(`F /lm-abcd1234-${k % 8} 727 680 ${k + 1}\n`) }
+  return { clock, spawned, spawnedAt, runs, posts, blits, toasts, stopped: () => stopped, frame }
 }
+
+const STATS = { command: 'lot-map', args: 'stats', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const
 
 test('in Ghostty the pane starts one helper, posts setup and board, and relays frames with their generation', SLOW, async ($, on) => {
   const w = world(on)
@@ -386,4 +427,101 @@ test('a still map switched to text by the gate ends its helper by the next H, an
   expect(w.spawned.length).toBe(2)
   expect(w.spawned.length - w.stopped()).toBe(1)
   expect(w.runs.filter(argv => argv[0] === 'pkill').length).toBe(2)
+})
+
+// ---- a frame not taken is asked for again ---------------------------------------------------------
+
+const SHM = (k: number) => ({ shm: `/lm-abcd1234-${k % 8}`, format: 'rgba', width: 727, height: 680, generation: k + 1 })
+
+test('a still map whose only frame meets the start-up refusal asks the helper again, and draws the next frame', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n === 1 ? { deny: STARTING } : {}), paints: true, silent: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0) // the one frame the setup and the empty board paint
+  await w.clock.settle()
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  await w.clock.advance(149)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  await w.clock.advance(1)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  expect(w.blits.map(b => b.name)).toEqual(['/lm-abcd1234-0', '/lm-abcd1234-1'])
+  await ui.redraw()
+  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual(SHM(1))
+  await w.clock.advance(30_000)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  expect((await $.command.run(STATS)).text).toMatch(/frames: 1 taken · 1 refused · 0 dropped · 1 asked again/)
+})
+
+test('a frame let go at the blit cap is asked for again, and the fresh one is drawn', SLOW, async ($, on) => {
+  const w = world(on, { late: n => (n <= 8 ? 100 : 0), paints: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  for (let k = 0; k < 9; k++) w.frame(k)
+  await w.clock.settle()
+  expect(w.blits.length).toBe(8) // eight unanswered: the ninth is let go
+  await w.clock.advance(100)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  await w.clock.advance(50)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  expect(w.blits.map(b => b.generation).at(-1)).toBe(10)
+  await ui.redraw()
+  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual(SHM(9))
+  expect((await $.command.run(STATS)).text).toMatch(/frames: 9 taken · 0 refused · 1 dropped · 1 asked again/)
+})
+
+test('a not-mounted refusal right after a render asked for a frame is asked again, not paused', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n === 2 ? { deny: NOT_MOUNTED } : {}), paints: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  await w.clock.advance(300)
+  await ui.redraw() // no frame for 300 ms: the render asks for one, which comes before the Image is mounted
+  await w.clock.settle()
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  await w.clock.advance(150)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame', '/frame'])
+  await ui.redraw()
+  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual(SHM(2))
+  expect((await $.command.run(STATS)).text).toMatch(/helper: running/)
+})
+
+test('a not-mounted refusal before any frame was taken, with no render asking, pauses; the next render resumes', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n === 1 ? { deny: NOT_MOUNTED } : {}) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.settle()
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/pause'])
+  await w.clock.advance(1000)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/pause'])
+  await ui.redraw()
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/pause', '/resume'])
+})
+
+test('five refusals in a row stop the asking, and nothing more is posted for a still map', SLOW, async ($, on) => {
+  const w = world(on, { blit: () => ({ deny: STARTING }), paints: true, silent: true })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  w.frame(0)
+  await w.clock.advance(5000)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame', '/frame', '/frame', '/frame', '/frame'])
+  expect(w.blits.length).toBe(6)
+  await w.clock.advance(60_000)
+  expect(w.posts.length).toBe(7)
+  expect((await $.command.run(STATS)).text).toMatch(/frames: 0 taken · 6 refused · 0 dropped · 5 asked again/)
+})
+
+test('frames that keep coming are not asked for again while they come; the last one not taken is', SLOW, async ($, on) => {
+  const w = world(on, { blit: n => (n <= 4 ? { deny: STARTING } : {}), paints: true })
+  await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await w.clock.settle()
+  for (let k = 0; k < 4; k++) {
+    w.frame(k)
+    await w.clock.advance(50)
+  }
+  expect(w.posts.map(path)).toEqual(['/setup', '/board'])
+  await w.clock.advance(100)
+  expect(w.posts.map(path)).toEqual(['/setup', '/board', '/frame'])
+  expect(w.blits.length).toBe(5)
 })
