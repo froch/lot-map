@@ -1,6 +1,6 @@
 {
   "name": "lot-map",
-  "version": "0.3.6",
+  "version": "0.4.0",
   "description": "A live map beside the chat: memory, files, shell, web, model, agents, skills and hooks light up as they are used",
   "license": "MIT",
   "types": "./types/index.d.ts",

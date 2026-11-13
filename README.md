@@ -22,7 +22,16 @@ claude plugin install lot-map --marketplace alexeyw/lot-map
 
 In the desktop app: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `alexeyw/lot-map`, then **Add plugin**.
 
-The pane opens by itself when a session starts. In a terminal it needs at least 144 columns and draws text only; otherwise type `/lot-map`. Built and tested on Claude Code 2.1.321 on macOS; users report it working on Windows as well.
+The pane opens by itself when a session starts. In a terminal it needs at least 144 columns; otherwise type `/lot-map`.
+
+In Ghostty or kitty, run locally, in Claude Code's fullscreen layout with the pane docked (110 columns or more), and with `bun` installed, the ring is a moving picture. Everywhere else it is text:
+
+- iTerm2 keeps every inline picture it receives, so its memory would grow without end;
+- in tmux, zellij, GNU screen and over ssh, shared memory can't reach the terminal;
+- VS Code's terminal, Terminal.app and any other terminal are not on the list;
+- a pane too short for a ring of 12 rows, and the inline pane, show text too.
+
+The `terminal` option turns the picture off. Built and tested on Claude Code 2.1.321 on macOS; users report it working on Windows as well.
 
 ## What lights up
 
@@ -83,9 +92,10 @@ The install offers them on a screen. Later, use `/config` in a terminal or `clau
 | `memoryLabels` | none | short names for memory tools, each as `tool=name` |
 | `hookRecords` | `false` | turn on if a hook of yours adds memory records numbered like `[#123]`; they appear on Memory by number only. Such a number in the text of any hook counts, not only a memory hook's |
 | `hookReasons` | `false` | show the first line of a hook's refusal, up to 72 characters; off, the map says only which tool was stopped |
-| `theme` | `auto` | the map's colours: `dark`, `light`, or `auto`, which is dark on a dark surface and light on a light one |
+| `theme` | `auto` | the map's colours: `dark`, `light`, or `auto`, which is dark on a dark surface and light on a light one; in a terminal it follows Claude Code's theme |
 | `background` | `solid` | the map's own background, or `transparent`, which lets the pane behind it show through. The rim around the labels keeps the background's colour, so on a surface of another shade it shows as a faint halo |
 | `colors` | none | colours of your own, each as `name=#rrggbb`; see [Colours of your own](#colours-of-your-own) |
+| `terminal` | `picture` | `picture`, a moving picture where the terminal allows it, or `text` |
 | `layout` | `you-top` | where you are on the map: `you-top`, or `you-bottom`, which turns the ring half a turn so that you are at the bottom and the network and the browser at the top |
 
 For example, Russian labels and your own memory server:
@@ -127,7 +137,16 @@ echo '{"theme":"dark","colors":"accent=#7fb4ff,active=#b8d6ff,text=#e6edf7"}' | 
 
 ## What it shows and what it keeps
 
-The mod makes no network requests, reads no files, runs no processes, calls no model and adds nothing to the conversation. Its rows live only for the session.
+In text mode, and in the desktop app, the mod makes no network requests, reads no files, runs no processes, calls no model and adds nothing to the conversation. Its rows live only for the session.
+
+Picture mode does more:
+
+- it starts a `bun` helper that paints the frames;
+- it runs `bun --version` to check that `bun` is there, and `pkill` to stop its own helper;
+- frames go through POSIX shared memory and never touch the disk;
+- it opens a local Unix socket in a private directory, for the helper alone;
+- it reads Claude Code's `theme` setting and a few environment variables (`TERM_PROGRAM`, `TERM`, `KITTY_WINDOW_ID`, `TMUX`, `ZELLIJ`, `STY`, `SSH_CONNECTION`, `SSH_TTY`, `TMPDIR`, `HOME`) to decide whether the terminal can show pictures;
+- the board, with its names and labels and never contents, passes through Claude Code's request machinery to the helper, so another plugin that watches requests could see it.
 
 Like any mod that follows tool calls, it is handed every call's whole input, including command lines and the text written to files. It takes names from that and nothing else; the code that does so is `classify` in `hooks/map.ts`. A marketplace added from this repository follows its `main` branch, so an update brings whatever is there: read the diff before updating if that matters to you.
 
@@ -147,12 +166,25 @@ Control characters are taken out of every label before it is drawn.
 
 A fault on the map never reaches a tool call or a model turn.
 
+## The picture's cost
+
+The helper paints at up to 20 frames a second while something moves, 15 for the never-ending loops, and nothing when the map is still. In testing it took about a fifth of a CPU core at 20 frames a second, and Claude Code itself about 3%. `/lot-map stats` shows what the picture has done so far: frames taken, and any refusals.
+
+## Font
+
+The picture is drawn with JetBrains Mono, under the SIL Open Font License 1.1 (`hooks/paint/OFL.txt`). The font's data is in `hooks/paint/font-data.ts`, 104,824 bytes.
+
 ## Developing
 
 ```bash
 claude plugin test .
 claude plugin validate .
+bun test helper
+bun scripts/bench.ts
+bun scripts/golden.ts check
 ```
+
+`bun scripts/golden.ts check` guards the desktop drawing against changes.
 
 Words live in `hooks/text.ts`; a new language is one more table there and one more value of `language` in `.claude-plugin/plugin.json`.
 
