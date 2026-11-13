@@ -152,6 +152,8 @@ Notes on the rule:
 
 ### Font (decided after a still, as the first step of the build)
 
+Decided (2026-11-12): outline — JetBrains Mono, compared in the docked iTerm2 pane against the stroke candidate. Label scale 1 (TEXT_SCALE).
+
 **The candidates.** The build's first step paints the same still with each, in the docked pane beside real terminal text, and the person picks one:
 
 1. Outlines from an open font, e.g. JetBrains Mono (SIL OFL 1.1), regular and bold, extracted by a development-time script into a generated data file. If chosen, ship the OFL text and state the data's size in the README.

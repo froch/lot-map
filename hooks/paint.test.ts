@@ -3,8 +3,7 @@ import { Canvas, parseColor } from './paint/canvas'
 import { circle, dashed, fill, line, parsePath, rotateAbout, roundRect, stroke } from './paint/path'
 import { STATIONS, setupFrom } from './map'
 import { COVERAGE, STILL_TEXT, missing } from './paint/font'
-import { OUTLINE } from './paint/font-outline'
-import { STROKE } from './paint/font-stroke'
+import { FONT } from './paint/font-data'
 import { drawText, textWidth } from './paint/text'
 import { stringsFor } from './text'
 
@@ -152,9 +151,8 @@ const inkColumns = (c: Canvas): [number, number] => {
   return [l, r]
 }
 
-test('the outline font covers every character the map can draw; the stroke font covers the still', () => {
-  expect(missing(OUTLINE, COVERAGE)).toEqual([])
-  expect(missing(STROKE, STILL_TEXT)).toEqual([])
+test('the font covers every character the map can draw', () => {
+  expect(missing(FONT, COVERAGE)).toEqual([])
 })
 
 test('the still text holds every station name in en, ru and de', () => {
@@ -163,18 +161,18 @@ test('the still text holds every station name in en, ru and de', () => {
 })
 
 test('text anchored in the middle is centred on x less half the trailing letter-spacing', () => {
-  const adv = (OUTLINE.regular.advance / OUTLINE.regular.unitsPerEm) * 20
-  near(textWidth(OUTLINE, 'HHH', 20, 4), 3 * (adv + 4))
+  const adv = (FONT.regular.advance / FONT.regular.unitsPerEm) * 20
+  near(textWidth(FONT, 'HHH', 20, 4), 3 * (adv + 4))
   const c = new Canvas(200, 40)
-  drawText(c, OUTLINE, { runs: [{ text: 'HHH', color: WHITE }], x: 100, y: 30, size: 20, anchor: 'middle', letterSpacing: 4 })
+  drawText(c, FONT, { runs: [{ text: 'HHH', color: WHITE }], x: 100, y: 30, size: 20, anchor: 'middle', letterSpacing: 4 })
   const [l, r] = inkColumns(c)
   near((l + r + 1) / 2, 98, 0.75)
 })
 
 test('a character the font lacks is a hollow box, and nothing throws', () => {
-  for (const font of [OUTLINE, STROKE]) {
+  {
     const c = new Canvas(60, 40)
-    drawText(c, font, { runs: [{ text: '日', color: WHITE }], x: 10, y: 30, size: 20, anchor: 'start' })
+    drawText(c, FONT, { runs: [{ text: '日', color: WHITE }], x: 10, y: 30, size: 20, anchor: 'start' })
     const [l, r] = inkColumns(c)
     expect(r - l).toBeGreaterThan(8)
     expect(c.pixel(Math.round((l + r) / 2), 24)[3]).toBe(0)
@@ -183,15 +181,10 @@ test('a character the font lacks is a hollow box, and nothing throws', () => {
 
 test('a rim is drawn around the letters in its own colour', () => {
   const c = new Canvas(80, 40)
-  drawText(c, OUTLINE, { runs: [{ text: 'O', color: WHITE }], x: 40, y: 30, size: 24, anchor: 'middle', rim: { color: parseColor('#0a0c11'), width: 5.6 } })
+  drawText(c, FONT, { runs: [{ text: 'O', color: WHITE }], x: 40, y: 30, size: 24, anchor: 'middle', rim: { color: parseColor('#0a0c11'), width: 5.6 } })
   let x = 0
   while (x < c.width && c.pixel(x, 22)[3] < 255) x++
   expect(c.pixel(x, 22)).toEqual([10, 12, 17, 255])
-})
-
-test("the stroke candidate keeps the outline candidate's advance and cap height in the em", () => {
-  near(STROKE.regular.advance / STROKE.regular.unitsPerEm, OUTLINE.regular.advance / OUTLINE.regular.unitsPerEm, 1e-6)
-  near(STROKE.regular.capHeight / STROKE.regular.unitsPerEm, OUTLINE.regular.capHeight / OUTLINE.regular.unitsPerEm, 1e-6)
 })
 
 test('one stroke call paints a pixel once, even where its lines cross', () => {
