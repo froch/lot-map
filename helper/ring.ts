@@ -1,12 +1,18 @@
 // The frames' names: a ring of `size` fixed names per session tag, each frame numbered by a running generation.
 // The terminal reads a name and unlinks it; until then the name is unread and cannot be written again.
 // The generation is the freshness marker of a reused name, so it starts at the clock when the helper starts: a
-// restarted helper with the same tag never repeats a (name, generation) pair of its predecessor.
+// restarted helper with the same tag never repeats a (name, generation) pair of its predecessor. The clock is taken
+// modulo 10^9, so a generation stays a small whole number (below 2^30) that any terminal path holds exactly.
 import type { Shm } from './shm'
 
 const EEXIST = 17
 /** A frame still unread this long after it was written is unlinked by `expire`. */
 export const EXPIRE_MS = 1000
+/** The clock's milliseconds are taken modulo this for the first generation: below 2^30, about 11.6 days round. */
+export const GENERATION_SPAN = 1_000_000_000
+
+/** The first generation of a helper starting at `now`: the clock modulo GENERATION_SPAN, never 0 (the plugin drops an F line whose generation is not positive). */
+export const firstGeneration = (now: number): number => now % GENERATION_SPAN || 1
 
 export class NameRing {
   private readonly names: string[]
@@ -20,11 +26,11 @@ export class NameRing {
     readonly tag: string,
     private readonly shm: Shm,
     readonly size = 8,
-    firstGeneration = Date.now(),
+    first = firstGeneration(Date.now()),
   ) {
     this.names = Array.from({ length: size }, (_, k) => `/lm-${tag}-${k}`)
     this.writtenAt = this.names.map(() => undefined)
-    this.generation = firstGeneration
+    this.generation = first
   }
 
   /** Unlinks every name of the ring, read or not: a predecessor's leftovers at start, what is unread at exit. */

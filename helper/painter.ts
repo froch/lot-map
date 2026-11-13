@@ -11,7 +11,7 @@ import { rmdirSync, rmSync, writeSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { LayerCache, paintScene } from '../hooks/paint/scene-paint'
 import { FrameLoop } from './loop'
-import { NameRing } from './ring'
+import { NameRing, firstGeneration } from './ring'
 import { prepareSocket, serve } from './server'
 import { loadShm } from './shm'
 import type { Shm } from './shm'
@@ -56,8 +56,9 @@ try {
   fail(`shm: ${oneLine(e)}`)
 }
 
-// The first generation is the clock at start, so a restart never repeats a (name, generation) pair.
-const ring = new NameRing(tag, shm, 8, Date.now())
+// The first generation is the clock at start modulo 10^9, so a restart never repeats a (name, generation) pair and
+// the generation stays below 2^30.
+const ring = new NameRing(tag, shm, 8, firstGeneration(Date.now()))
 ring.clean()
 
 let stopping = false
